@@ -1,0 +1,57 @@
+{
+  "name": "plan-review-workflow",
+  "displayName": "CodeFlow Conductor",
+  "description": "Coordinate AI-assisted requirements, planning, implementation, review, acceptance, and remediation from VS Code.",
+  "version": "0.47.5",
+  "publisher": "local-workflow",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:planReview.sidebar",
+    "onCommand:planReview.open"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "planReview.open",
+        "title": "CodeFlow Conductor: Open"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "planReview",
+          "title": "CodeFlow",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "planReview": [
+        {
+          "type": "webview",
+          "id": "planReview.sidebar",
+          "name": "Workflow"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --platform=node --target=node20 --external:vscode --outfile=dist/extension.js",
+    "check": "tsc --noEmit",
+    "test": "esbuild src/prerequisite-state.ts src/process-lifecycle.ts src/workflow-safety.ts src/requirements.ts src/mobile.ts --bundle --platform=node --target=node20 --outdir=dist && node --test test/*.test.js",
+    "package": "npm run build && vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  }
+}

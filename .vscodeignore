@@ -1,0 +1,11 @@
+src/**
+test/**
+node_modules/**
+.vscode/**
+*.vsix
+tsconfig.json
+dist/prerequisite-state.js
+dist/mobile.js
+dist/process-lifecycle.js
+dist/requirements.js
+dist/workflow-safety.js
