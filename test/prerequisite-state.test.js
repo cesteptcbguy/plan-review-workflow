@@ -51,9 +51,15 @@ test('owner replies resolve only exact pending work explicitly claimed by review
     'Give explicit owner approval before feature implementation.'
   ];
   assert.deepEqual(resolvePendingOwnerWork(pending, 'I approve feature implementation.', [pending[1]]), {
-    remaining: [pending[0]],
-    resolved: [pending[1]]
+    remaining: pending,
+    resolved: []
   });
+  assert.deepEqual(resolvePendingOwnerWork(pending, 'I approve implementation.', pending), { remaining: pending, resolved: [] });
+  const deployment = 'Approve production deployment.';
+  const deferredDeployment = 'Approve deployment at a later date.';
+  assert.deepEqual(resolvePendingOwnerWork([deferredDeployment], `Owner decision: ${deferredDeployment} — APPROVE`, [deferredDeployment]), { remaining: [], resolved: [deferredDeployment] });
+  assert.deepEqual(resolvePendingOwnerWork([deployment], `Owner decision: ${deployment} — APPROVE`, [deployment]), { remaining: [], resolved: [deployment] });
+  assert.deepEqual(resolvePendingOwnerWork(pending, `Resolved owner item: ${pending[0]} — answer: I choose the blue theme.`, [pending[0]]), { remaining: [pending[1]], resolved: [pending[0]] });
   assert.deepEqual(resolvePendingOwnerWork(pending, 'Approval is still pending.', pending), {
     remaining: pending,
     resolved: []

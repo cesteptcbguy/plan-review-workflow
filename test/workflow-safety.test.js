@@ -1,5 +1,29 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { recordOwnerImplementationConsent } = require('../dist/workflow-safety.js');
+
+test('affirmative answers to another question never grant implementation consent', () => {
+  const record = { pendingAfterPrerequisite: ['Approve feature implementation.'] };
+  recordOwnerImplementationConsent(record, 'Yes, I choose the blue theme.');
+  assert.equal(hasPendingOwnerApproval(record), true);
+  recordOwnerImplementationConsent(record, 'Example reply:\nI approve implementation.\nI do not approve implementation.');
+  assert.equal(hasPendingOwnerApproval(record), true);
+  recordOwnerImplementationConsent(record, 'I approve implementation.');
+  assert.equal(record.ownerImplementationDecision, 'approved');
+  assert.equal(hasPendingOwnerApproval(record), false);
+});
+
+test('implementation consent preserves deployment and other separate approvals', () => {
+  const deployment = 'Approve production deployment.';
+  const record = { pendingAfterPrerequisite: ['Give explicit owner approval before feature implementation.', deployment, 'Authorize paid provider access.'] };
+  recordOwnerImplementationConsent(record, 'I approve implementation');
+  assert.equal(record.ownerImplementationDecision, 'approved');
+  assert.deepEqual(record.pendingAfterPrerequisite, [deployment, 'Authorize paid provider access.']);
+  assert.equal(hasPendingOwnerApproval(record), false);
+  const compound = { pendingAfterPrerequisite: ['Approve implementation and production deployment.'] };
+  recordOwnerImplementationConsent(compound, 'I approve implementation');
+  assert.deepEqual(compound.pendingAfterPrerequisite, ['Approve implementation and production deployment.']);
+});
 const { validatePrerequisiteResults, hasPendingOwnerApproval } = require('../dist/workflow-safety.js');
 
 test('pending owner approval blocks implementation independently of readiness decisions', () => {

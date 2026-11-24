@@ -5,6 +5,32 @@ const path = require('node:path');
 const test = require('node:test');
 const { allowedActions, dashboardHtml, MobileBridge } = require('../dist/mobile.js');
 
+test('mobile API rejects missing and obsolete checkpoint IDs across identical runs', async () => {
+  let calls = 0;
+  const bridge = new MobileBridge({ enabled: false, ntfyServer: '', ntfyTopic: '' }, async () => { calls++; }, () => {});
+  const snapshot = { status: '', task: 'same task', running: false, paused: true, artifacts: [], interaction: { type: 'prerequisitePending', text: 'same checklist', humanProcedure: true } };
+  bridge.updateState({ ...snapshot, runId: 'run-a' });
+  const oldId = bridge.snapshot.checkpointId;
+  bridge.updateState({ ...snapshot, runId: 'run-a' });
+  assert.equal(bridge.snapshot.checkpointId, oldId);
+  bridge.updateState({ ...snapshot, runId: 'run-b' });
+  assert.notEqual(bridge.snapshot.checkpointId, oldId);
+  async function submit(checkpointId) {
+    const request = require('node:stream').Readable.from([JSON.stringify({ type: 'recheckPrerequisite', checkpointId, humanInput: 'observed' })]);
+    request.url = '/api/action'; request.method = 'POST';
+    request.headers = { cookie: `plan_review_session=${bridge.sessionToken}` };
+    let status;
+    await bridge.handleRequest(request, { writeHead(code) { status = code; }, end() {} });
+    return status;
+  }
+  assert.equal(await submit(undefined), 409);
+  assert.equal(await submit(oldId), 409);
+  assert.equal(calls, 0);
+  assert.equal(await submit(bridge.snapshot.checkpointId), 200);
+  assert.equal(calls, 1);
+  bridge.dispose();
+});
+
 test('phone dashboard permits roadmap acceptance', () => {
   assert.equal(allowedActions.has('acceptRoadmap'), true);
   assert.equal(allowedActions.has('continueWithoutGeneratedBaseline'), true);

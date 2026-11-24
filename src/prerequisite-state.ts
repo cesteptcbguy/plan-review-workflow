@@ -77,16 +77,21 @@ export function resolvePendingOwnerWork(
 ): { remaining: string[]; resolved: string[] } {
   const pending = [...new Set((pendingOwnerWork ?? []).map(item => item.trim()).filter(Boolean))];
   const reply = currentReply.trim();
-  if (!reply || !claimedResolvedItems?.length
-    || /\b(?:still\s+pending|approval\s+(?:is\s+)?pending|not\s+(?:yet\s+)?approved|do\s+not\s+approve|unanswered|not\s+answered|cannot\s+answer|defer(?:red)?|later)\b/i.test(reply)) {
+  if (!reply || !claimedResolvedItems?.length) {
     return { remaining: pending, resolved: [] };
   }
   const byKey = new Map(pending.map(item => [item.toLocaleLowerCase().replace(/\s+/g, ' '), item]));
-  const affirmative = /\b(?:approve|approved|authorize|authorized|yes|resolved|complete|completed|done|pass|passed|choose|chosen|select|selected|decision|answer|provided)\b/i.test(reply);
-  if (!affirmative) return { remaining: pending, resolved: [] };
   const resolved = [...new Set(claimedResolvedItems.flatMap(item => {
     const match = byKey.get(String(item).trim().toLocaleLowerCase().replace(/\s+/g, ' '));
-    return match ? [match] : [];
+    if (!match) return [];
+    if (/approv|authoriz/i.test(match)) {
+      return reply === `Owner decision: ${match} — APPROVE` ? [match] : [];
+    }
+    // An answer about implementation cannot settle another owner question.
+    const prefix = `Resolved owner item: ${match} — answer:`;
+    const answer = reply.split('\n').find(line => line.trim().startsWith(prefix));
+    const value = answer?.trim().slice(prefix.length).trim() ?? '';
+    return value && !/\b(?:still pending|unanswered|not answered|cannot answer|deferred)\b/i.test(value) ? [match] : [];
   }))];
   const resolvedKeys = new Set(resolved);
   return { remaining: pending.filter(item => !resolvedKeys.has(item)), resolved };

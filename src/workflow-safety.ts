@@ -81,8 +81,22 @@ export function validatePrerequisiteResults(procedure: string, submission: strin
   });
 }
 
-export function hasPendingOwnerApproval(record: { pendingAfterPrerequisite?: string[] }): boolean {
-  return (record.pendingAfterPrerequisite ?? []).some(item => /approv|authoriz/i.test(item));
+export function recordOwnerImplementationConsent(record: { ownerImplementationDecision?: 'pending' | 'approved'; pendingAfterPrerequisite?: string[] }, reply: string): void {
+  if ((record.pendingAfterPrerequisite ?? []).some(item => /approv|authoriz/i.test(item) && /implement/i.test(item))) record.ownerImplementationDecision = 'pending';
+  // Consent is an owner decision, never an orchestrator's resolution claim.
+  if (/^I (?:approve|authorize) (?:feature |the )?implementation[.!]?$/i.test(reply.trim())) {
+    record.ownerImplementationDecision = 'approved';
+    record.pendingAfterPrerequisite = (record.pendingAfterPrerequisite ?? []).filter(item => !isImplementationApprovalItem(item));
+  }
+}
+
+export function isImplementationApprovalItem(item: string): boolean {
+  // Only a standalone implementation decision can be consumed by this consent.
+  return /^(?:give (?:explicit )?(?:owner |human )?(?:approval|authorization) (?:before|for) (?:feature |the )?implementation|(?:approve|authorize) (?:feature |the )?implementation)[.!]?$/i.test(item.trim());
+}
+
+export function hasPendingOwnerApproval(record: { ownerImplementationDecision?: 'pending' | 'approved'; pendingAfterPrerequisite?: string[] }): boolean {
+  return record.ownerImplementationDecision === 'pending' || (record.pendingAfterPrerequisite ?? []).some(item => /approv|authoriz/i.test(item) && /implement/i.test(item));
 }
 
 export function requiresExplicitImplementationApproval(record: { implementationRequiresHumanApproval?: boolean; remediationOfRunId?: string }): boolean {

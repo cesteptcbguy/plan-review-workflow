@@ -97,22 +97,10 @@ function escapePattern(value: string): string {
 }
 
 export function explicitlyWritablePaths(task: string): string[] {
-  const clauses = task.split(/(?:\r?\n|(?<=[.!?;])\s+)/);
-  const writeVerbSource = String.raw`\b(?:writ(?:e|ing)|creat(?:e|ing)|updat(?:e|ed|ing)|replac(?:e|ed|ing)|edit(?:ed|ing)?|sav(?:e|ed|ing)|deliver(?:ed|ing)?|publish(?:ed|ing)?|append(?:ed|ing)?|add(?:ed|ing)?|modif(?:y|ied|ying)|apply\s+(?:a\s+)?(?:change|changes|replacement|replacements)\s+to)\b`;
-  return clauses.flatMap(clause => {
-    const verbs = [...clause.matchAll(new RegExp(writeVerbSource, 'gi'))];
-    return [...clause.matchAll(/(?:doc|docs)\/[A-Za-z0-9_./<>-]+(?:\.md)?/gi)].flatMap(pathMatch => {
-      const destinationIndex = pathMatch.index ?? 0;
-      const verb = verbs.filter(item => (item.index ?? -1) < destinationIndex).at(-1);
-      if (!verb) return [];
-      const verbIndex = verb.index ?? 0;
-      const prefix = clause.slice(Math.max(0, verbIndex - 40), verbIndex);
-      if (/\b(?:do\s+not|must\s+not|shall\s+not|never|without)\b/i.test(prefix)) return [];
-      const bindingText = clause.slice(verbIndex + verb[0].length, destinationIndex);
-      if (/\b(?:using|referencing|consulting|based\s+on|as\s+context|context\s+from|after\s+reading|according\s+to)\b/i.test(bindingText)) return [];
-      return [pathMatch[0].replace(/[),.;:]+$/, '')];
-    });
-  });
+  // Only this owner-entered field grants delivery authority. Prose references
+  // (including "write a summary of ...") cannot become destinations.
+  return [...task.matchAll(/^Write destination:\s*`?((?:doc|docs)\/[A-Za-z0-9_./<>-]+\.md)`?\s*$/gim)]
+    .map(match => match[1]);
 }
 
 export function isAuthorizedPlanningDocument(task: string, relative: string): boolean {

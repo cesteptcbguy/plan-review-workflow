@@ -1,5 +1,13 @@
 # CodeFlow Conductor
 
+Implementation approval is tracked independently of deployment and other owner decisions. Existing pending lists cannot suppress an explicit implementation gate; fresh planning, plan publication, resume, and code entry check the current task and plan. Recorded implementation consent prevents the same gate from being added again.
+
+Implementation consent consumes only the standalone implementation approval. Deployment, provider access, and combined approvals remain pending for their own decision. Reply with only `I approve implementation` for implementation consent. Other decisions use the exact item-specific response shown in the prompt; quoted examples or a contradictory multiline reply cannot authorize implementation. Saved approval questions are restored on resume, including recovery from interrupted saves and stale code-round metadata.
+
+Bounded document delivery requires owner-entered destination fields, one per line, such as `Write destination: docs/planning/summary.md`. Prose that describes a source document grants no write authority. Destination lists saved before this explicit format was introduced are re-derived only from the original owner request; generated child text cannot grant access.
+
+When explicit implementation approval remains pending, answer with `I approve implementation` to record that decision. Answers to other questions and model resolution claims cannot supply this consent. Phone actions carry a server-issued checkpoint ID; stale drafts and submissions from another run are rejected even when checklist text is identical.
+
 A local VS Code extension that coordinates AI-assisted requirements, planning, implementation, review, acceptance, and remediation using your own Claude Code and Codex sign-ins. It does not ask for API keys or send requests to a paid API directly.
 
 The technical extension ID, VSIX filename prefix, command IDs, and legacy `Plan Review Workflow` provenance marker remain unchanged so existing installations, published plans, and saved runs continue to work after the CodeFlow Conductor rename.

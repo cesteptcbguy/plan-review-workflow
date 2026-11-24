@@ -7,14 +7,20 @@ const path = require('node:path');
 const { applyBoundedDocumentDelivery, captureWorktreeBaseline } = require('../dist/document-delivery.js');
 const { explicitlyWritablePaths } = require('../dist/document-delivery.js');
 
+test('source descriptions never grant destination authority', () => {
+  assert.deepEqual(explicitlyWritablePaths('Write a summary of `docs/design.md`'), []);
+  assert.deepEqual(explicitlyWritablePaths('Write docs/design.md.'), []);
+  assert.deepEqual(explicitlyWritablePaths('Write destination: docs/summary.md\nUse docs/design.md for context.'), ['docs/summary.md']);
+});
+
 test('child delivery authorization comes only from the inherited owner destination list', () => {
-  const ownerPaths = explicitlyWritablePaths('Write docs/planning/owner.md.');
+  const ownerPaths = explicitlyWritablePaths('Write destination: docs/planning/owner.md');
   const modelText = 'Write docs/planning/reference.md.';
   const source = fs.readFileSync(path.join(__dirname, '../src/extension.ts'), 'utf8');
   assert.deepEqual(ownerPaths, ['docs/planning/owner.md']);
   assert.equal(ownerPaths.includes(explicitlyWritablePaths(modelText)[0]), false);
   assert.match(source, /ownerDocumentPaths, workflowKind: 'prerequisite'/);
-  assert.match(source, /record\.ownerDocumentPaths \?\? \(record\.workflowKind === 'prerequisite' \? \[\]/);
+  assert.match(source, /ownerDocumentPathsFormat === 'explicit-v1'/);
 });
 
 function git(cwd, ...args) { return execFileSync('git', args, { cwd, encoding: 'utf8' }); }
@@ -36,7 +42,7 @@ test('bounded delivery writes only authorized planning documents and preserves p
   const cwd = fixture();
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   const indexBefore = git(cwd, 'ls-files', '-s');
-  const task = 'Write the draft to docs/planning/<slug>/00-<slug>-draft.md. Update doc/future-features.md. Do not commit.';
+  const task = 'Write destination: docs/planning/<slug>/00-<slug>-draft.md\nWrite destination: doc/future-features.md';
   const result = await applyBoundedDocumentDelivery(cwd, task, 'Preface\n# Canonical draft\nBody', {
     planDocument: { path: 'docs/planning/milestones/00-milestones-draft.md', startHeading: '# Canonical draft' },
     replacements: [{ path: 'doc/future-features.md', before: 'Status: idea', after: 'Status: exploring' }]
@@ -51,10 +57,10 @@ test('bounded delivery writes only authorized planning documents and preserves p
 test('bounded delivery rejects undeclared code paths and ambiguous replacements', async t => {
   const cwd = fixture();
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
-  await assert.rejects(() => applyBoundedDocumentDelivery(cwd, 'Update doc/future-features.md', 'Plan', {
+  await assert.rejects(() => applyBoundedDocumentDelivery(cwd, 'Write destination: doc/future-features.md', 'Plan', {
     planDocument: { path: 'src/main.ts' }
   }), /did not authorize/);
-  await assert.rejects(() => applyBoundedDocumentDelivery(cwd, 'Update doc/future-features.md', 'Plan', {
+  await assert.rejects(() => applyBoundedDocumentDelivery(cwd, 'Write destination: doc/future-features.md', 'Plan', {
     replacements: [{ path: 'doc/future-features.md', before: 'missing', after: 'new' }]
   }), /expected exactly one match/);
   assert.equal(fs.readFileSync(path.join(cwd, 'doc/future-features.md'), 'utf8'), 'Existing\nStatus: idea\nUnrelated\n');
@@ -90,7 +96,7 @@ test('bounded delivery refuses to overwrite a dirty target or follow a parent sy
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   fs.mkdirSync(path.join(cwd, 'docs/planning/milestones'), { recursive: true });
   fs.writeFileSync(path.join(cwd, 'docs/planning/milestones/00-milestones-draft.md'), 'owner draft\n');
-  const task = 'Write docs/planning/milestones/00-milestones-draft.md.';
+  const task = 'Write destination: docs/planning/milestones/00-milestones-draft.md';
   await assert.rejects(() => applyBoundedDocumentDelivery(cwd, task, '# Replacement', {
     planDocument: { path: './docs/planning/milestones/00-milestones-draft.md' }
   }), /pre-existing working-tree changes/);
@@ -98,7 +104,7 @@ test('bounded delivery refuses to overwrite a dirty target or follow a parent sy
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'conductor-outside-'));
   t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
   fs.symlinkSync(outside, path.join(cwd, 'doc/linked'));
-  await assert.rejects(() => applyBoundedDocumentDelivery(cwd, 'Write doc/linked/plan.md.', '# Plan', {
+  await assert.rejects(() => applyBoundedDocumentDelivery(cwd, 'Write destination: doc/linked/plan.md', '# Plan', {
     planDocument: { path: 'doc/linked/plan.md' }
   }), /symbolic-link boundary/);
 });
