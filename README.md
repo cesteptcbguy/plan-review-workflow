@@ -1,5 +1,11 @@
 # CodeFlow Conductor
 
+Checklist results come from actual named or numbered entries. References to earlier O-checks in surrounding prose do not create result rows or hide numbered steps. Mixed checklists retain evidence rows for both named checks and numbered steps.
+
+Numbered operator checklists show editable results on desktop and phone, with a separate observation required for each step, including Markdown lists with repeated `1.` markers. Evidence fingerprints identify the prerequisite and checklist actually reviewed; replacing a prerequisite cannot suppress its first recheck, even with unchanged evidence and repository state. Older fingerprints without an identity are checked once again.
+
+Split-phase parent navigation remains available while paused; verified prerequisite completion is required only for the prerequisite report-and-recheck return. Failed prerequisite reviews leave their evidence retryable, and unchanged evidence is suppressed only after a completed review. Checklist result validation uses the same template availability as the form. Recorded implementation consent survives resolution of a combined approval, and bounded document replacements preserve literal dollar sequences.
+
 Implementation approval is tracked independently of deployment and other owner decisions. Existing pending lists cannot suppress an explicit implementation gate; fresh planning, plan publication, resume, and code entry check the current task and plan. Recorded implementation consent prevents the same gate from being added again.
 
 Implementation consent consumes only the standalone implementation approval. Deployment, provider access, and combined approvals remain pending for their own decision. Reply with only `I approve implementation` for implementation consent. Other decisions use the exact item-specific response shown in the prompt; quoted examples or a contradictory multiline reply cannot authorize implementation. Saved approval questions are restored on resume, including recovery from interrupted saves and stale code-round metadata.

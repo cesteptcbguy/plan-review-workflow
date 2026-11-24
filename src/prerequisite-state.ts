@@ -98,6 +98,10 @@ export function resolvePendingOwnerWork(
 }
 
 /** Rechecking identical evidence and repository state must not consume another review round. */
+export function prerequisiteReviewKey(prerequisite: { title: string; reason: string; resumeWhen: string; workType?: string }, procedure: string): string {
+  return JSON.stringify([prerequisite.title, prerequisite.reason, prerequisite.resumeWhen, prerequisite.workType ?? '', procedure]);
+}
+
 export function prerequisiteEvidenceChanged(
   previousSubmission: string | undefined,
   previousRepositoryDigest: string | undefined,

@@ -38,6 +38,16 @@ function fixture() {
   return cwd;
 }
 
+test('document replacements preserve literal dollar substitution sequences', async t => {
+  const cwd = fixture();
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  const literal = "$& $$ $` $' $1";
+  await applyBoundedDocumentDelivery(cwd, 'Write destination: doc/future-features.md', 'Plan', {
+    replacements: [{ path: 'doc/future-features.md', before: 'Status: idea', after: literal }]
+  });
+  assert.equal(fs.readFileSync(path.join(cwd, 'doc/future-features.md'), 'utf8'), `Existing\n${literal}\nUnrelated\n`);
+});
+
 test('bounded delivery writes only authorized planning documents and preserves pre-existing changes and the index', async t => {
   const cwd = fixture();
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));

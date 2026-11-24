@@ -2,7 +2,7 @@
   "name": "plan-review-workflow",
   "displayName": "CodeFlow Conductor",
   "description": "Coordinate AI-assisted requirements, planning, implementation, review, acceptance, and remediation from VS Code.",
-  "version": "0.47.21",
+  "version": "0.47.24",
   "publisher": "local-workflow",
   "engines": {
     "vscode": "^1.96.0"

@@ -183,7 +183,7 @@ export async function applyBoundedDocumentDelivery(cwd: string, task: string, pl
         const current = await fs.readFile(target, 'utf8');
         const occurrences = current.split(operation.before).length - 1;
         if (occurrences !== 1) throw new Error(`Replacement for ${operation.path} expected exactly one match but found ${occurrences}.`);
-        await fs.writeFile(target, current.replace(operation.before, operation.after), 'utf8');
+        await fs.writeFile(target, current.replace(operation.before, () => operation.after), 'utf8');
       }
     }
     const after = await captureWorktreeBaseline(cwd);

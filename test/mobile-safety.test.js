@@ -43,7 +43,7 @@ test('phone dashboard exposes and validates human prerequisite results', () => {
   assert.match(html, /Complete the prerequisite results before rechecking/);
   assert.match(html, /Record results and recheck prerequisite/);
   assert.match(html, /if\(humanPrerequisite&&type==='startPrerequisiteWorkflow'\)continue/);
-  assert.match(extensionSource, /procedure && !validatePrerequisiteResults\(procedure, submission\)/);
+  assert.match(extensionSource, /humanPrerequisiteResponseTemplate\(procedure\) && !validatePrerequisiteResults\(procedure, submission\)/);
   assert.match(html, /nextCheckpointKey!==checkpointKey/);
 });
 

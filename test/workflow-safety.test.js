@@ -1,6 +1,34 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { recordOwnerImplementationConsent } = require('../dist/workflow-safety.js');
+const { resolvePendingOwnerWork } = require('../dist/prerequisite-state.js');
+
+test('references to prior checks cannot replace required numbered observations', () => {
+  const procedure = 'Use the prior O-3 result for context.\n1. Open app.\n2. Inspect window.';
+  const template = humanPrerequisiteResponseTemplate(procedure);
+  assert.doesNotMatch(template, /^O-3:/m);
+  assert.match(template, /^Step 1:/m);
+  assert.match(template, /^Step 2:/m);
+  assert.equal(validatePrerequisiteResults(procedure, 'O-3: PASS — observation: prior result'), false);
+  assert.equal(validatePrerequisiteResults(procedure, 'Step 1: PASS — observation: opened\nStep 2: PASS — observation: visible'), true);
+  const mixed = '### O-4 — Inspect access\n1. Use the prior O-3 for context.\n2. Inspect window.';
+  assert.match(humanPrerequisiteResponseTemplate(mixed), /^O-4:/m);
+  assert.match(humanPrerequisiteResponseTemplate(mixed), /^Step 2:/m);
+  assert.equal(validatePrerequisiteResults(mixed, 'O-4: PASS — observation: allowed'), false);
+});
+
+test('resolving a combined approval preserves implementation consent across restart', () => {
+  const combined = 'Approve implementation and deployment';
+  const record = { pendingAfterPrerequisite: ['Approve implementation.', combined] };
+  recordOwnerImplementationConsent(record, 'I approve implementation');
+  const resumed = JSON.parse(JSON.stringify(record));
+  const reply = `Owner decision: ${combined} — APPROVE`;
+  recordOwnerImplementationConsent(resumed, reply);
+  resumed.pendingAfterPrerequisite = resolvePendingOwnerWork(resumed.pendingAfterPrerequisite, reply, [combined]).remaining;
+  assert.deepEqual(resumed.pendingAfterPrerequisite, []);
+  assert.equal(resumed.ownerImplementationDecision, 'approved');
+  assert.equal(hasPendingOwnerApproval(resumed), false);
+});
 
 test('affirmative answers to another question never grant implementation consent', () => {
   const record = { pendingAfterPrerequisite: ['Approve feature implementation.'] };
@@ -32,7 +60,7 @@ test('pending owner approval blocks implementation independently of readiness de
 });
 
 test('prerequisite results require every current checklist row and filled observations', () => {
-  const procedure = 'O-0 and O-3 observations';
+  const procedure = 'O-0 — First observation\nO-3 — Second observation';
   assert.equal(validatePrerequisiteResults(procedure, 'O-0: PASS — observation: visible'), false);
   assert.equal(validatePrerequisiteResults(procedure, 'O-0: PASS — observation: visible\nO-3: PASS — observation:'), false);
   assert.equal(validatePrerequisiteResults(procedure, 'O-0: PASS — observation: visible\nO-3: UNVERIFIED — observation: access unavailable, admin will confirm'), true);

@@ -32,10 +32,18 @@ export function humanPrerequisiteProcedure(plan: string, prerequisiteText: strin
 }
 
 export function humanPrerequisiteResponseTemplate(procedure: string): string {
-  const identifiers = [...new Set(procedure.match(/\bO-\d+[A-Z0-9.-]*\b/gi) ?? [])]
+  const itemLines = procedure.split('\n').map(line => line.replace(/[*_`]/g, ''));
+  const namedItem = /^\s*(?:(?:#{1,6}|[-+])\s+|\d+[.)]\s+)?(O-\d+[A-Z0-9.-]*)(?=\s*[:—–-]|\s*$)/i;
+  const identifiers = [...new Set(itemLines.flatMap(line => {
+    const match = namedItem.exec(line);
+    return match ? [match[1].toUpperCase()] : [];
+  }))]
     .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
-  if (!identifiers.length) return '';
-  const resultLines = identifiers.flatMap(identifier => {
+  // Markdown allows every source marker to be "1."; each row still needs evidence.
+  const numberedSteps = itemLines.filter(line => /^\s*\d+[.)]\s+\S/.test(line))
+    .flatMap((line, index) => namedItem.test(line) ? [] : [String(index + 1)]);
+  if (!identifiers.length && !numberedSteps.length) return '';
+  const resultLines = [...identifiers.flatMap(identifier => {
     const normalized = identifier.toUpperCase();
     if (normalized === 'O-1') return ['O-1: PASS/FAIL/UNVERIFIED — documented support: ; effective create permission: ; functional: UNTESTED'];
     if (normalized === 'O-2') return ['O-2: PASS/FAIL/UNVERIFIED — documented support: ; write-tool permission: ; functional: UNTESTED'];
@@ -48,7 +56,7 @@ export function humanPrerequisiteResponseTemplate(procedure: string): string {
       ...'abcd'.split('').map(part => `O-7(${part}): PASS/FAIL/UNVERIFIED/N/A — observation:`),
     ];
     return [`${normalized}: PASS/FAIL/UNVERIFIED — observation:`];
-  });
+  }), ...numberedSteps.map(number => `Step ${number}: PASS/FAIL/UNVERIFIED — observation:`)];
   return [
     'Human prerequisite session',
     'Date:',
@@ -64,7 +72,7 @@ export function humanPrerequisiteResponseTemplate(procedure: string): string {
 export function validatePrerequisiteResults(procedure: string, submission: string): boolean {
   const template = humanPrerequisiteResponseTemplate(procedure);
   if (!template || !submission.trim() || hasUnresolvedAcceptanceTemplate(submission)) return false;
-  const rows = template.split('\n').filter(line => /^O-\d/.test(line));
+  const rows = template.split('\n').filter(line => /^(?:O-\d|Step \d+:)/.test(line));
   return rows.every(row => {
     const label = row.slice(0, row.indexOf(':'));
     const actual = submission.split('\n').find(line => line.trim().startsWith(`${label}:`));
@@ -82,7 +90,7 @@ export function validatePrerequisiteResults(procedure: string, submission: strin
 }
 
 export function recordOwnerImplementationConsent(record: { ownerImplementationDecision?: 'pending' | 'approved'; pendingAfterPrerequisite?: string[] }, reply: string): void {
-  if ((record.pendingAfterPrerequisite ?? []).some(item => /approv|authoriz/i.test(item) && /implement/i.test(item))) record.ownerImplementationDecision = 'pending';
+  if (record.ownerImplementationDecision !== 'approved' && (record.pendingAfterPrerequisite ?? []).some(item => /approv|authoriz/i.test(item) && /implement/i.test(item))) record.ownerImplementationDecision = 'pending';
   // Consent is an owner decision, never an orchestrator's resolution claim.
   if (/^I (?:approve|authorize) (?:feature |the )?implementation[.!]?$/i.test(reply.trim())) {
     record.ownerImplementationDecision = 'approved';

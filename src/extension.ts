@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { attachPrerequisiteReport, canAutoApplyFinalCanonicalCorrection, inferWorkflowPurpose, isCompletedPrerequisiteState, normalizePrerequisitePlanningDecision, parentOutcomeAfterPrerequisite, planningCheckpointInteractionType, prerequisiteEvidenceChanged, prerequisitePublicationPrefix, resolvePendingOwnerWork, type PrerequisiteReport, type WorkflowPurpose } from './prerequisite-state';
+import { attachPrerequisiteReport, canAutoApplyFinalCanonicalCorrection, inferWorkflowPurpose, isCompletedPrerequisiteState, normalizePrerequisitePlanningDecision, parentOutcomeAfterPrerequisite, planningCheckpointInteractionType, prerequisiteEvidenceChanged, prerequisitePublicationPrefix, prerequisiteReviewKey, resolvePendingOwnerWork, type PrerequisiteReport, type WorkflowPurpose } from './prerequisite-state';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
@@ -44,7 +44,7 @@ type CodeDecisionResult = {
   responseTemplate: string;
   humanAcceptanceRequired: boolean;
 };
-type RunRecord = { ownerImplementationDecision?: 'pending' | 'approved'; ownerDocumentPathsFormat?: 'explicit-v1'; ownerDocumentPaths?: string[]; id: string; task: string; originalTask?: string; workflowName?: string; workflowKind?: 'root' | 'split-phase' | 'prerequisite' | 'remediation'; workflowPurpose?: WorkflowPurpose; phasePath?: number[]; prerequisitePath?: number[]; prerequisiteParentRunId?: string; prerequisiteOrdinal?: number; prerequisiteReports?: PrerequisiteReport[]; prerequisiteCompletionReport?: PrerequisiteReport; pendingAfterPrerequisite?: string[]; resumeAfterPrerequisite?: ResumeStage; lastPrerequisiteSubmission?: string; lastPrerequisiteRepositoryDigest?: string; startingState?: WorktreeBaseline; taskFilePath?: string; humanInput?: string; implementationApprovalGuidance?: string; implementationRequiresHumanApproval?: boolean; guidanceEntries?: GuidanceEntry[]; roadmapAcceptance?: RoadmapAcceptance; sourcePlanPath?: string; requirementsSourcePath?: string; requirementsGuard?: RequirementsGuardState; claudeSessions?: { planner?: string; plannerStartedRound?: number; implementer?: string; implementerStartedRound?: number }; parentRunId?: string; returnToRunFile?: string; splitPhaseIndex?: number; splitPhaseTitle?: string; completedPhaseIndexes?: number[]; finalPlanIndexPath?: string; baselinePlanPath?: string; workingDraftPath?: string; approvedPlanPath?: string; splitPhases?: SplitPhase[]; prerequisite?: Prerequisite; orchestratorDirection?: string; planningLedger?: PlanningLedger; remediationOfRunId?: string; supersededByRemediationRunId?: string; preset: Preset; stage: string; resumeStage?: ResumeStage; round: number; decision?: Decision; detail?: string; codeRound?: number; codeStage?: string; codeResumeStage?: CodeResumeStage; codeDecision?: CodeDecision; codeDetail?: string; codeDirection?: string; secondaryCodeApprovalStatus?: 'pending' | 'approved'; secondaryCodeApprovalRound?: number; verificationRetryCount?: number; additionalDirectories?: string[]; acceptanceStatus?: 'pending' | 'failed' | 'complete'; acceptanceInstructions?: string; pendingHumanActions?: string[]; acceptanceResponseTemplate?: string; acceptanceResultsPath?: string; files: string[] };
+type RunRecord = { ownerImplementationDecision?: 'pending' | 'approved'; ownerDocumentPathsFormat?: 'explicit-v1'; ownerDocumentPaths?: string[]; id: string; task: string; originalTask?: string; workflowName?: string; workflowKind?: 'root' | 'split-phase' | 'prerequisite' | 'remediation'; workflowPurpose?: WorkflowPurpose; phasePath?: number[]; prerequisitePath?: number[]; prerequisiteParentRunId?: string; prerequisiteOrdinal?: number; prerequisiteReports?: PrerequisiteReport[]; prerequisiteCompletionReport?: PrerequisiteReport; pendingAfterPrerequisite?: string[]; resumeAfterPrerequisite?: ResumeStage; lastPrerequisiteKey?: string; lastPrerequisiteSubmission?: string; lastPrerequisiteRepositoryDigest?: string; startingState?: WorktreeBaseline; taskFilePath?: string; humanInput?: string; implementationApprovalGuidance?: string; implementationRequiresHumanApproval?: boolean; guidanceEntries?: GuidanceEntry[]; roadmapAcceptance?: RoadmapAcceptance; sourcePlanPath?: string; requirementsSourcePath?: string; requirementsGuard?: RequirementsGuardState; claudeSessions?: { planner?: string; plannerStartedRound?: number; implementer?: string; implementerStartedRound?: number }; parentRunId?: string; returnToRunFile?: string; splitPhaseIndex?: number; splitPhaseTitle?: string; completedPhaseIndexes?: number[]; finalPlanIndexPath?: string; baselinePlanPath?: string; workingDraftPath?: string; approvedPlanPath?: string; splitPhases?: SplitPhase[]; prerequisite?: Prerequisite; orchestratorDirection?: string; planningLedger?: PlanningLedger; remediationOfRunId?: string; supersededByRemediationRunId?: string; preset: Preset; stage: string; resumeStage?: ResumeStage; round: number; decision?: Decision; detail?: string; codeRound?: number; codeStage?: string; codeResumeStage?: CodeResumeStage; codeDecision?: CodeDecision; codeDetail?: string; codeDirection?: string; secondaryCodeApprovalStatus?: 'pending' | 'approved'; secondaryCodeApprovalRound?: number; verificationRetryCount?: number; additionalDirectories?: string[]; acceptanceStatus?: 'pending' | 'failed' | 'complete'; acceptanceInstructions?: string; pendingHumanActions?: string[]; acceptanceResponseTemplate?: string; acceptanceResultsPath?: string; files: string[] };
 type ResumeContext = { runDir: string; record: RunRecord; stage: ResumeStage; round: number; plan?: string; review?: string; orchestratorDirection?: string };
 type StartRelationship = { ownerDocumentPathsFormat?: 'explicit-v1'; ownerDocumentPaths?: string[]; workflowKind: RunRecord['workflowKind']; workflowPurpose?: WorkflowPurpose; prerequisiteParentRunId?: string; prerequisitePath?: number[]; prerequisiteOrdinal?: number; pendingAfterPrerequisite?: string[]; resumeAfterPrerequisite?: ResumeStage };
 type SplitContext = { runDir: string; record: RunRecord; phases: SplitPhase[]; plan?: string };
@@ -376,7 +376,7 @@ async function discoverCodexModels(): Promise<AccountModel[]> {
         finish(error instanceof Error ? error : new Error(String(error)));
       }
     });
-    send({ method: 'initialize', id: 1, params: { clientInfo: { name: 'plan_review_workflow', title: 'CodeFlow Conductor', version: '0.47.21' } } });
+    send({ method: 'initialize', id: 1, params: { clientInfo: { name: 'plan_review_workflow', title: 'CodeFlow Conductor', version: '0.47.24' } } });
   });
 }
 
@@ -2257,21 +2257,27 @@ class WorkflowView implements vscode.WebviewViewProvider {
     const submission = humanInput.trim();
     const prerequisiteText = `${pending.prerequisite.title}\n${pending.prerequisite.reason}\n${pending.prerequisite.resumeWhen}`;
     const procedure = humanPrerequisiteProcedure(pending.plan ?? '', prerequisiteText);
-    if (procedure && !validatePrerequisiteResults(procedure, submission)) {
+    const reviewKey = prerequisiteReviewKey(pending.prerequisite, procedure);
+    if (humanPrerequisiteResponseTemplate(procedure) && !validatePrerequisiteResults(procedure, submission)) {
       throw new Error('Complete the prerequisite results field before rechecking. Replace every placeholder with PASS, FAIL, or UNVERIFIED and the requested observation.');
     }
     const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const repositoryDigest = workspace ? await prerequisiteRepositoryDigest(workspace) : '';
-    if (!prerequisiteEvidenceChanged(pending.record.lastPrerequisiteSubmission, pending.record.lastPrerequisiteRepositoryDigest, submission, repositoryDigest)) {
+    if (pending.record.lastPrerequisiteKey === reviewKey && !prerequisiteEvidenceChanged(pending.record.lastPrerequisiteSubmission, pending.record.lastPrerequisiteRepositoryDigest, submission, repositoryDigest)) {
       this.showWaitingForPrerequisite(pending.runDir, pending.record, pending.plan ?? '', pending.review, pending.prerequisite!);
       this.setStatus('Still waiting for the prerequisite. No submitted evidence or relevant repository state changed, so no review round was consumed.');
       this.sendViewState();
       return;
     }
-    pending.record.lastPrerequisiteSubmission = submission;
-    pending.record.lastPrerequisiteRepositoryDigest = repositoryDigest;
-    await fs.writeFile(path.join(pending.runDir, 'run.json'), JSON.stringify(pending.record, null, 2), 'utf8');
     await this.start(pending.record.task, pending.record.preset, submission, { ...pending, stage: 'reviewing', review: undefined });
+    // Only a completed review that remains at this gate consumes this evidence.
+    // Provider failure, cancellation, and pause must leave the submission retryable.
+    if (pending.record.stage === 'waiting_for_prerequisite' && pending.record.decision === 'WAITING_FOR_PREREQUISITE') {
+      pending.record.lastPrerequisiteKey = reviewKey;
+      pending.record.lastPrerequisiteSubmission = submission;
+      pending.record.lastPrerequisiteRepositoryDigest = repositoryDigest;
+      await fs.writeFile(path.join(pending.runDir, 'run.json'), JSON.stringify(pending.record, null, 2), 'utf8');
+    }
   }
 
   private async startPrerequisiteWorkflow(): Promise<void> {
@@ -2320,6 +2326,11 @@ class WorkflowView implements vscode.WebviewViewProvider {
     if (!this.currentRunFile) throw new Error('The completed prerequisite run could not be identified. Open its saved run and try again.');
     const childRunDir = path.dirname(this.currentRunFile);
     const child = JSON.parse(await fs.readFile(this.currentRunFile, 'utf8')) as RunRecord;
+    if (child.workflowKind !== 'prerequisite' && child.parentRunId
+      && path.resolve(target) === path.resolve(path.join(path.dirname(childRunDir), child.parentRunId, 'run.json'))) {
+      await this.resumeRun(target);
+      return;
+    }
     if (!isCompletedPrerequisiteState(child)) throw new Error('This prerequisite has not reached verified completion, so its parent cannot be rechecked yet.');
     const report = await persistPrerequisiteCompletionReport(childRunDir, child);
     await fs.writeFile(this.currentRunFile, JSON.stringify(child, null, 2), 'utf8');
@@ -3742,6 +3753,7 @@ ${JSON.stringify(result, null, 2)}`,
           const pending = inferPendingAfterPrerequisite(record, plan);
           record.pendingAfterPrerequisite = pending;
           record.prerequisite = undefined;
+          record.lastPrerequisiteKey = undefined;
           record.lastPrerequisiteSubmission = undefined;
           record.lastPrerequisiteRepositoryDigest = undefined;
           if (parentOutcomeAfterPrerequisite(pending) === 'needs-owner-input') {
@@ -4476,7 +4488,7 @@ function validatePreset(value: unknown): Preset {
 function html(): string {
   return `<!doctype html><html><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';"><style>
   :root{--blue:#58a6ff;--green:#3fb950;--purple:#bc8cff;--orange:#d29922;--pink:#f778ba;--cyan:#39c5cf}html{overflow-y:auto;scroll-padding-bottom:96px}body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);padding:12px 12px 96px;margin:0;overflow-y:auto}h1{font-size:18px;margin:0}.app-header{margin:2px 0 14px}.title-row{display:flex;align-items:center;gap:8px}.version{font-size:11px;font-weight:600;padding:2px 7px;border:1px solid var(--blue);border-radius:10px;color:var(--blue)}h2{font-size:14px;margin:10px 0 4px}label{display:block;margin:10px 0 4px}input,select,textarea,button{box-sizing:border-box;width:100%;padding:6px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border)}textarea{min-height:85px}button{margin-top:8px;cursor:pointer;background:var(--vscode-button-background);color:var(--vscode-button-foreground)}button:disabled,input:disabled,select:disabled,textarea:disabled{cursor:not-allowed;opacity:.5}.row,.button-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}.check-row{display:flex;align-items:flex-start;gap:8px;margin:12px 0 4px}.check-row input{width:auto;margin:2px 0 0}.check-row label{margin:0;line-height:1.35}.secondary{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}.workflow-section{--accent:var(--blue);border:1px solid var(--vscode-panel-border);border-left:3px solid var(--accent);border-radius:4px;margin:0 0 12px;overflow:hidden;background:var(--vscode-sideBar-background)}.workflow-section>summary{cursor:pointer;font-size:13px;font-weight:700;padding:9px 10px;color:var(--accent);background:var(--vscode-sideBarSectionHeader-background);user-select:none}.workflow-section[open]>summary{border-bottom:1px solid var(--vscode-panel-border)}.section-body{padding:3px 10px 11px}.tone-green{--accent:var(--green)}.tone-purple{--accent:var(--purple)}.tone-orange{--accent:var(--orange)}.tone-pink{--accent:var(--pink)}.tone-cyan{--accent:var(--cyan)}.role{border-top:1px solid var(--vscode-panel-border);margin-top:12px;padding-top:4px}.role:first-child{border-top:0;margin-top:4px}.role h2{color:var(--vscode-descriptionForeground)}#status,#interactionPrompt,#interactionDetailsText{white-space:pre-wrap;user-select:text;-webkit-user-select:text}#status{font-weight:600;line-height:1.4;padding:8px;border-left:3px solid var(--green);background:var(--vscode-textBlockQuote-background)}#status:empty{display:none}#interaction{padding-bottom:36px}#interactionDetails{margin:10px 0;border:1px solid var(--vscode-panel-border);padding:8px}#interactionDetails summary{cursor:pointer;font-weight:600}#interactionDetailsText{font-family:var(--vscode-font-family);font-size:12px;line-height:1.4}#artifacts{margin-top:10px}#artifacts button{text-align:left;font-size:12px}.muted{opacity:.8;font-size:12px}.phase{border:1px solid var(--vscode-panel-border);padding:8px;margin-top:8px}.phase strong,.phase span{display:block}.phase span{margin-top:5px;white-space:pre-wrap}</style></head><body>
-  <header class="app-header"><div class="title-row"><h1>CodeFlow Conductor</h1><span class="version">v0.47.21</span></div><p class="muted">From requirements to reviewed, accepted code.</p></header>
+  <header class="app-header"><div class="title-row"><h1>CodeFlow Conductor</h1><span class="version">v0.47.24</span></div><p class="muted">From requirements to reviewed, accepted code.</p></header>
   <details class="workflow-section tone-purple" open><summary>Presets</summary><div class="section-body"><label>Saved preset</label><select id="presetList"></select><div class="button-row"><button id="loadPreset" class="secondary">Load selected</button><button id="deletePreset" class="secondary">Delete selected</button></div><label>Preset name</label><input id="name"><div class="button-row"><button id="save" class="secondary">Save preset</button><button id="renamePreset" class="secondary">Rename selected</button></div><p class="muted">To rename, load a preset, edit its name, then choose Rename selected.</p></div></details>
   <details class="workflow-section tone-green" open><summary>Starting point</summary><div class="section-body"><label>Task</label><textarea id="task" placeholder="Describe the change to plan"></textarea><label>Existing plan (optional)</label><button id="choosePlan" class="secondary">Choose an existing plan</button><p id="selectedPlan" class="muted">No plan selected — the planner will create one.</p></div></details>
   <details class="workflow-section tone-orange"><summary>Local Ollama assistance</summary><div class="section-body"><label>Requirements baseline</label><select id="requirementsGuard"><option value="off">Off — use the existing workflow</option><option value="ollama">Ollama — extract locally, then require human approval</option></select><label>Ollama model</label><input id="ollamaModel" list="ollamaModels" placeholder="Choose an installed local model"><datalist id="ollamaModels"></datalist><button id="refreshOllamaModels" class="secondary">Refresh local Ollama models</button><button id="chooseRequirementsSource" class="secondary">Choose approved specification (optional)</button><p id="selectedRequirementsSource" class="muted">The task and approved parent roadmap will be used when no separate specification is selected.</p><label>Local planning starter</label><select id="localPlanningStarter"><option value="on">On — prepare a first draft or revision packet for Claude</option><option value="off">Off</option></select><label>Local implementation starter</label><select id="localImplementationStarter"><option value="on">On — prepare an advisory file-and-test work packet first</option><option value="off">Off — Claude starts implementation without it</option></select><p class="muted">Ollama starters are advisory and cannot approve work. Claude sessions are resumed between rounds when Claude Code returns a session ID.</p></div></details>
