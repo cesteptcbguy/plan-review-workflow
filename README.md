@@ -8,7 +8,9 @@ The technical extension ID, VSIX filename prefix, command IDs, and legacy `Plan 
 
 - Sidebar settings for planner, plan reviewer, orchestrator, implementer, and code reviewer provider, model, and effort
 - Optional local requirements guard using an installed Ollama model. Ollama extracts a structured baseline, but cannot approve a plan or make a readiness decision.
-- Human corrections are stored in a cumulative locked ledger. Regeneration cannot discard an earlier correction, and any prior extracted requirement omitted by a later candidate is carried forward automatically.
+- Human corrections are stored in a cumulative locked ledger. Regeneration cannot discard an earlier correction, and approved prior requirements omitted by a later candidate are carried forward automatically.
+- Only requirements from an approved prior baseline are automatically carried forward. An unapproved or rejected extraction can be replaced without preserving its mistaken constraints, while locked owner and source-traceable corrections remain authoritative.
+- Generated-baseline capacity and generation failures preserve the complete candidate, review, corrections, and failure evidence without truncation. With secondary approval enabled, the optional baseline is declined automatically; otherwise **Continue from approved source without generated baseline** resumes the same run from its task, selected specification, owner decisions, and parent context.
 - A human approval checkpoint freezes the reconciled requirements baseline before planning continues.
 - Existing planning checkpoints offer **Attach local requirements guard to this run**, so an in-progress workflow can adopt the guard without restarting.
 - Deterministic pre-review checks verify the approved baseline digest, required IDs, technologies, package manager, and milestones before another Claude or Codex architectural review is used.
@@ -21,9 +23,10 @@ The technical extension ID, VSIX filename prefix, command IDs, and legacy `Plan 
 - Paused or failed runs can optionally select a different saved preset before **Resume current run** or **Retry failed stage**. The switch preserves accumulated round limits and evidence, clears old Claude session IDs so the new model is honored, and continues from the existing working tree
 - Color-accented, collapsible sidebar sections for presets, starting point, Ollama assistance, model settings, workflow progress, and phone controls, with the installed version shown beside the title
 - Optional Claude Explore subagent model override, defaulting to Haiku to reduce usage without changing the primary role models
-- Completed prerequisite side workflows end on a dedicated **Return to waiting workflow** action beside the result, including recovery of links for older runs
-- Prerequisite rechecks can return **PHASE_COMPLETE** when the saved phase is already implemented and accepted, preventing “approve and close” decisions from becoming another planning or implementation loop
-- A completed prerequisite recheck ends with an explicit **Workflow complete** message instead of the generic code-ready handoff
+- Completed prerequisite side workflows end on a dedicated **Return and recheck parent** action. It attaches a structured, idempotent completion report and immediately rechecks the saved parent, including migrated links for older runs.
+- Prerequisites have an explicit purpose—implementation, planning-document delivery, verification, or external evidence—and their own `p01`, `p02` hierarchy. They appear in the workflow index but never inflate implementation phase counts.
+- A completed prerequisite clears only its parent gate. Open owner questions, explicit approval, or other recorded parent work remain pending until a review names the exact item resolved by affirmative owner evidence; partial or still-pending replies cannot clear the queue.
+- Rechecking with identical submitted evidence and unchanged repository state does not consume another review round.
 - Acceptance templates cannot be submitted while they still contain `PASS/FAIL`, `YES/NO`, or placeholder values; resuming a run also repairs older false completions created from an untouched template
 - Claude directory permissions preserve quoted paths containing spaces and grant the narrowest required folder instead of a broader home-directory ancestor
 - Prerequisite-completion detection that prevents completed side workflows from being sent through additional planning rounds
@@ -59,7 +62,7 @@ The technical extension ID, VSIX filename prefix, command IDs, and legacy `Plan 
 - Durable original task storage in each run's `original-task.md`
 - Workspace-level memory of the most recent run, including across VS Code restarts
 - Working plans stay with their run history under `.review-workflow/runs/<id>/working-plan.md`
-- Only plans approved for implementation are published to `docs/planning/`
+- Only plans approved for implementation are published to `docs/planning/`, except an explicitly authorized planning-document-delivery prerequisite. Every destination needs an explicit write, create, update, or replacement instruction; merely mentioning a Markdown file for context is not authorization. The bounded path canonicalizes equivalent spellings before its dirty-file, backup, and Git checks, preserves the Git index and unrelated working changes, and rejects undeclared or symbolic-link targets.
 - Human response control when the orchestrator returns `NEEDS_HUMAN`; the answer continues the same round and decision stage
 - Complete human handoffs that display why the workflow paused, the required actions, saved checklist/result files, and the expected response format
 - Provider failures are shown separately from human questions and include Codex's structured error detail
@@ -91,13 +94,13 @@ The technical extension ID, VSIX filename prefix, command IDs, and legacy `Plan 
 - Human acceptance phases stay as one operator checklist and results-recording plan. Planning agents are instructed not to invent harnesses, cryptographic evidence systems, schemas, or semantic gates unless the original task or repository explicitly requires them.
 - Nested phase splitting is capped at two levels. Repeated findings, plan length, or evidence formatting cannot create another split; the child must converge into one executable plan or ask for a genuine human decision. Child planning is capped at twelve rounds, with rounds 10–12 reserved for a final convergence pass that applies existing corrections without introducing new requirements or optional hardening.
 - Plans blocked by work outside their current split hierarchy enter **Waiting for prerequisite** instead of implementation, failure, or another planning loop. The phase remains saved and incomplete, states the exact resume condition, and offers **Start prerequisite workflow** plus **Recheck prerequisite**. Existing acceptance runs with an explicit unmet gate are repaired when resumed.
-- **Recheck prerequisite** runs a fresh repository review before the orchestrator decides, so completed commits and a newly clean tree replace the evidence from the original blocked review.
+- **Recheck prerequisite** runs a fresh repository review before the orchestrator decides, so completed commits and a changed tree replace the evidence from the original blocked review. It does not require a clean tree unless the parent’s own acceptance contract does.
 - Sibling evidence inheritance accepts only completed child runs, so an abandoned or failed attempt for the same parent phase cannot be mistaken for the replacement run that eventually completed it.
 - Provider prompts and returned plans replace literal null bytes with visible `\\0` text so malformed generated examples cannot crash the Claude or Codex command process.
 - At the 30-round safety ceiling, **Run remaining verification and final review** retries the saved final round once, preserves its previous artifacts, and performs a concluding review
 - When a blocked verification command targets a folder under the user's home directory but outside the repository, choosing the final-verification action records that folder in the run and passes it to Claude Code with `--add-dir`
 - Free phone notifications through a private, randomly generated ntfy topic
-- An authenticated phone dashboard for answering workflow questions and using pause, resume, phase, planning, and implementation controls
+- An authenticated phone dashboard for answering workflow questions and using pause, resume, phase, planning, and implementation controls. Human prerequisite checkpoints show their results field and refuse an untouched checklist template.
 - A six-digit pairing step in addition to Microsoft dev tunnel authentication; the phone dashboard never accepts arbitrary commands
 - Microsoft tunnel failures show the provider's actual error. Temporary rate limits wait for the cooldown and retry automatically instead of leaving an unexplained exit-code message.
 - Only one VS Code window can own the phone dashboard tunnel at a time. The sidebar includes a dedicated stop action, gives each tunnel a one-hour maximum lifetime, and explicitly removes the tunnel when its host exits.

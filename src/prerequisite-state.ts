@@ -5,9 +5,101 @@ export type PrerequisiteCompletionState = {
   returnToRunFile?: string;
 };
 
-/** Planning may make a prerequisite implementation-ready, but cannot finish it. */
-export function normalizePrerequisitePlanningDecision(decision: string, hasWaitingWorkflow: boolean): string {
-  return hasWaitingWorkflow && decision === 'PREREQUISITE_COMPLETE' ? 'READY_TO_CODE' : decision;
+export type WorkflowPurpose = 'implementation' | 'planning-document-delivery' | 'verification' | 'external-evidence';
+
+export type PrerequisiteDecisionContext = {
+  hasWaitingWorkflow: boolean;
+  purpose?: WorkflowPurpose;
+};
+
+/**
+ * A linked implementation prerequisite still needs the implementation cycle.
+ * Evidence, verification, and bounded document-delivery prerequisites may finish
+ * directly after their evidence is checked.
+ */
+export function normalizePrerequisitePlanningDecision(decision: string, context: PrerequisiteDecisionContext | boolean): string {
+  const normalized = typeof context === 'boolean' ? { hasWaitingWorkflow: context } : context;
+  if (!normalized.hasWaitingWorkflow || decision !== 'PREREQUISITE_COMPLETE') return decision;
+  return (normalized.purpose ?? 'implementation') === 'implementation' ? 'READY_TO_CODE' : decision;
+}
+
+export function inferWorkflowPurpose(text: string): WorkflowPurpose {
+  if (/\b(?:planning[- ]document delivery|write[- ]enabled.*delivery)\b/i.test(text)
+    || /\b(?:write|update|create|deliver|publish)\b.{0,80}\b(?:planning document|draft|backlog|roadmap)\b/i.test(text)) return 'planning-document-delivery';
+  if (/\b(?:verification|verify|evidence|inspection|read[- ]only review)\b/i.test(text)) return 'verification';
+  if (/\b(?:human support|account team|credential|permission|external service|outside observation)\b/i.test(text)) return 'external-evidence';
+  return 'implementation';
+}
+
+export function prerequisitePublicationPrefix(phasePath: number[] | undefined, prerequisitePath: number[] | undefined): string {
+  const phase = (phasePath ?? []).map(value => String(value).padStart(2, '0'));
+  const prerequisite = (prerequisitePath ?? []).map(value => `p${String(value).padStart(2, '0')}`);
+  if (!prerequisite.length) return phase.join('-');
+  return [...(phase.length ? phase : ['00']), ...prerequisite].join('-');
+}
+
+export type PrerequisiteReport = {
+  reportId: string;
+  sourceRunId: string;
+  completedAt: string;
+  purpose: WorkflowPurpose;
+  outcome: 'complete';
+  summary: string;
+  evidencePaths: string[];
+  digest: string;
+};
+
+export function attachPrerequisiteReport<T extends PrerequisiteReport>(existing: T[] | undefined, report: T): { reports: T[]; added: boolean } {
+  const reports = [...(existing ?? [])];
+  if (reports.some(item => item.reportId === report.reportId || (item.sourceRunId === report.sourceRunId && item.digest === report.digest))) {
+    return { reports, added: false };
+  }
+  reports.push(report);
+  return { reports, added: true };
+}
+
+export type ParentPrerequisiteOutcome = 'needs-owner-input' | 'resume-parent-work';
+
+/** A completed child clears only its gate; it never completes its parent. */
+export function parentOutcomeAfterPrerequisite(pendingOwnerWork: string[] | undefined): ParentPrerequisiteOutcome {
+  return (pendingOwnerWork ?? []).some(item => item.trim()) ? 'needs-owner-input' : 'resume-parent-work';
+}
+
+/**
+ * Owner work is removed only after the orchestrator names the exact item and the
+ * current reply contains affirmative evidence. A generic or explicitly pending
+ * reply never clears the queue.
+ */
+export function resolvePendingOwnerWork(
+  pendingOwnerWork: string[] | undefined,
+  currentReply: string,
+  claimedResolvedItems: string[] | undefined,
+): { remaining: string[]; resolved: string[] } {
+  const pending = [...new Set((pendingOwnerWork ?? []).map(item => item.trim()).filter(Boolean))];
+  const reply = currentReply.trim();
+  if (!reply || !claimedResolvedItems?.length
+    || /\b(?:still\s+pending|approval\s+(?:is\s+)?pending|not\s+(?:yet\s+)?approved|do\s+not\s+approve|unanswered|not\s+answered|cannot\s+answer|defer(?:red)?|later)\b/i.test(reply)) {
+    return { remaining: pending, resolved: [] };
+  }
+  const byKey = new Map(pending.map(item => [item.toLocaleLowerCase().replace(/\s+/g, ' '), item]));
+  const affirmative = /\b(?:approve|approved|authorize|authorized|yes|resolved|complete|completed|done|pass|passed|choose|chosen|select|selected|decision|answer|provided)\b/i.test(reply);
+  if (!affirmative) return { remaining: pending, resolved: [] };
+  const resolved = [...new Set(claimedResolvedItems.flatMap(item => {
+    const match = byKey.get(String(item).trim().toLocaleLowerCase().replace(/\s+/g, ' '));
+    return match ? [match] : [];
+  }))];
+  const resolvedKeys = new Set(resolved);
+  return { remaining: pending.filter(item => !resolvedKeys.has(item)), resolved };
+}
+
+/** Rechecking identical evidence and repository state must not consume another review round. */
+export function prerequisiteEvidenceChanged(
+  previousSubmission: string | undefined,
+  previousRepositoryDigest: string | undefined,
+  submission: string,
+  repositoryDigest: string,
+): boolean {
+  return previousSubmission !== submission || previousRepositoryDigest !== repositoryDigest;
 }
 
 /** Explanatory prose is deliberately excluded from completion detection. */

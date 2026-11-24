@@ -22,6 +22,69 @@ export function completedAcceptanceNeedsReopen(results: string): boolean {
   return hasUnresolvedAcceptanceTemplate(results) || acceptanceOutcome(results) !== 'pass';
 }
 
+export function humanPrerequisiteProcedure(plan: string, prerequisiteText: string): string {
+  if (!/\b(?:human|operator|interactive|observations?|account)\b/i.test(prerequisiteText)) return '';
+  const start = /^##\s+(?:\d+[.)]?\s*)?Operator checklist\s*$/im.exec(plan);
+  if (!start || start.index === undefined) return '';
+  const remainder = plan.slice(start.index);
+  const end = /^##\s+(?:\d+[.)]?\s*)?Decision rules(?:\s+and[^\n]*)?\s*$/im.exec(remainder);
+  return remainder.slice(0, end?.index ?? remainder.length).trim().slice(0, 30_000);
+}
+
+export function humanPrerequisiteResponseTemplate(procedure: string): string {
+  const identifiers = [...new Set(procedure.match(/\bO-\d+[A-Z0-9.-]*\b/gi) ?? [])]
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+  if (!identifiers.length) return '';
+  const resultLines = identifiers.flatMap(identifier => {
+    const normalized = identifier.toUpperCase();
+    if (normalized === 'O-1') return ['O-1: PASS/FAIL/UNVERIFIED — documented support: ; effective create permission: ; functional: UNTESTED'];
+    if (normalized === 'O-2') return ['O-2: PASS/FAIL/UNVERIFIED — documented support: ; write-tool permission: ; functional: UNTESTED'];
+    if (normalized === 'O-6') return [
+      'O-6 overall: PASS/FAIL/UNVERIFIED',
+      ...'abcdefg'.split('').map(part => `O-6(${part}): PASS/FAIL/UNVERIFIED — observation:`),
+    ];
+    if (normalized === 'O-7') return [
+      'O-7 overall: PASS/FAIL/UNVERIFIED — documented minimum Read + Use:',
+      ...'abcd'.split('').map(part => `O-7(${part}): PASS/FAIL/UNVERIFIED/N/A — observation:`),
+    ];
+    return [`${normalized}: PASS/FAIL/UNVERIFIED — observation:`];
+  });
+  return [
+    'Human prerequisite session',
+    'Date:',
+    'Account labels (no names, emails, IDs, or secrets): A=; W=; O=',
+    '',
+    ...resultLines,
+    '',
+    'Secrets or identifying values recorded: NO',
+    'Unavailable evidence / responsible administrator or support role / precise next action:',
+  ].join('\n');
+}
+
+export function validatePrerequisiteResults(procedure: string, submission: string): boolean {
+  const template = humanPrerequisiteResponseTemplate(procedure);
+  if (!template || !submission.trim() || hasUnresolvedAcceptanceTemplate(submission)) return false;
+  const rows = template.split('\n').filter(line => /^O-\d/.test(line));
+  return rows.every(row => {
+    const label = row.slice(0, row.indexOf(':'));
+    const actual = submission.split('\n').find(line => line.trim().startsWith(`${label}:`));
+    if (!actual) return false;
+    const value = actual.slice(actual.indexOf(':') + 1).trim();
+    if (!/^(?:PASS|FAIL|UNVERIFIED|N\/A)\b/.test(value)) return false;
+    const fields = row.split(/—|;/).slice(1).map(field => field.trim()).filter(field => field.includes(':'));
+    if (!fields.length) return true;
+    return fields.every(field => {
+      const key = field.slice(0, field.indexOf(':') + 1);
+      const index = value.indexOf(key);
+      return index >= 0 && Boolean(value.slice(index + key.length).split(';')[0].trim());
+    });
+  });
+}
+
+export function hasPendingOwnerApproval(record: { pendingAfterPrerequisite?: string[] }): boolean {
+  return (record.pendingAfterPrerequisite ?? []).some(item => /approv|authoriz/i.test(item));
+}
+
 export function requiresExplicitImplementationApproval(record: { implementationRequiresHumanApproval?: boolean; remediationOfRunId?: string }): boolean {
   return record.implementationRequiresHumanApproval === true || Boolean(record.remediationOfRunId);
 }

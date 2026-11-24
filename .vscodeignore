@@ -9,3 +9,5 @@ dist/mobile.js
 dist/process-lifecycle.js
 dist/requirements.js
 dist/workflow-safety.js
+dist/model-discovery.js
+dist/document-delivery.js

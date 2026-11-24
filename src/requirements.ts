@@ -17,6 +17,16 @@ export type LockedCorrection = {
   source: string;
 };
 
+export type RecordedRequirementsCorrection = { createdAt: string; text: string };
+
+export function parseLockedCorrectionsMarkdown(value: string): RecordedRequirementsCorrection[] {
+  return value.split(/^## LOCK-[^\n]*$/gm).slice(1).flatMap(section => {
+    const recorded = /^\s*Recorded:\s*([^\n]+)\s*$/m.exec(section)?.[1]?.trim() ?? '';
+    const text = section.replace(/^\s*Recorded:\s*[^\n]+\s*$/m, '').trim();
+    return text ? [{ createdAt: recorded || new Date(0).toISOString(), text }] : [];
+  });
+}
+
 export type RequirementsBaseline = {
   version: 2;
   scope: string;
@@ -42,6 +52,25 @@ export type PreservationReport = {
   warnings: string[];
   coverage?: PlanCoverage;
 };
+
+export const requirementsSafetyLimit = 80;
+
+export class RequirementsCapacityError extends Error {
+  readonly code = 'REQUIREMENTS_CAPACITY';
+  constructor(
+    readonly operation: 'extraction' | 'reconciliation',
+    readonly requirementCount: number,
+    readonly candidate: RequirementsBaseline,
+  ) {
+    super(`${operation === 'extraction' ? 'Generated extraction' : 'Generated reconciliation'} contains ${requirementCount} requirements, exceeding the ${requirementsSafetyLimit}-item generated-baseline safety limit. The complete candidate was preserved. This does not invalidate the authoritative product scope; continue from the approved source when the optional extractor cannot represent it safely.`);
+    this.name = 'RequirementsCapacityError';
+  }
+}
+
+export function isRequirementsCapacityError(error: unknown): error is RequirementsCapacityError {
+  return error instanceof RequirementsCapacityError
+    || Boolean(error && typeof error === 'object' && (error as { code?: string }).code === 'REQUIREMENTS_CAPACITY');
+}
 
 const baselineSchema = {
   type: 'object',
@@ -111,10 +140,7 @@ export function normalizeBaseline(value: unknown): RequirementsBaseline {
       source: String(item.source ?? 'Human correction').trim() || 'Human correction'
     }];
   }) : [];
-  if (requirements.length > 80) {
-    throw new Error(`Ollama returned ${requirements.length} unique requirements, exceeding the 80-item safety limit. Narrow the current phase or correct the baseline instead of silently dropping requirements.`);
-  }
-  return {
+  const baseline: RequirementsBaseline = {
     version: 2,
     scope: String(raw.scope ?? '').trim() || 'Approved requirements for the current planning scope.',
     requirements,
@@ -124,6 +150,8 @@ export function normalizeBaseline(value: unknown): RequirementsBaseline {
     requiredMilestones: strings(raw.requiredMilestones),
     deferred: strings(raw.deferred)
   };
+  if (requirements.length > requirementsSafetyLimit) throw new RequirementsCapacityError('extraction', requirements.length, baseline);
+  return baseline;
 }
 
 const comparisonStopWords = new Set([
@@ -196,8 +224,10 @@ function technologyKey(value: string): string {
 export function reconcileRequirementsBaseline(
   previous: RequirementsBaseline | undefined,
   candidate: RequirementsBaseline,
-  corrections: Array<{ createdAt?: string; text: string }>
+  corrections: Array<{ createdAt?: string; text: string }>,
+  options: { preservePreviousRequirements?: boolean } = {},
 ): { baseline: RequirementsBaseline; preservedRequirements: number } {
+  const authoritativePrevious = options.preservePreviousRequirements === false ? undefined : previous;
   const correctionTexts = [...new Set(corrections.map(item => item.text.trim()).filter(Boolean))];
   const lockedCorrections: LockedCorrection[] = correctionTexts.map((text, index) => ({
     id: `LOCK-${String(index + 1).padStart(3, '0')}`,
@@ -208,14 +238,15 @@ export function reconcileRequirementsBaseline(
   }));
 
   const negatedAlternatives = [...cumulativeNegatedAlternatives(correctionTexts)];
-  const contradictsLockedCorrection = (text: string) => negatedAlternatives.some(term => {
-    if (!new RegExp(`\\b${escapeRegExp(term)}\\b`, 'i').test(text)) return false;
-    return !new RegExp(`(?:do not|must not|no|never|exclude|without)[^.!?\\n]{0,60}\\b${escapeRegExp(term)}\\b`, 'i').test(text);
-  });
+  const contradictsLockedCorrection = (text: string) => correctionTexts.some(correction => hasOpposingClause(correction, text))
+    || negatedAlternatives.some(term => {
+      if (!new RegExp(`\\b${escapeRegExp(term)}\\b`, 'i').test(text)) return false;
+      return !new RegExp(`(?:do not|must not|no|never|exclude|without)[^.!?\\n]{0,60}\\b${escapeRegExp(term)}\\b`, 'i').test(text);
+    });
 
   const requirements = candidate.requirements.filter(item => !contradictsLockedCorrection(item.text));
   let preservedRequirements = 0;
-  for (const prior of previous?.requirements ?? []) {
+  for (const prior of authoritativePrevious?.requirements ?? []) {
     if (contradictsLockedCorrection(prior.text)) continue;
     const covered = requirements.some(item => requirementSimilarity(prior.text, item.text) >= 0.50);
     if (!covered) {
@@ -224,18 +255,15 @@ export function reconcileRequirementsBaseline(
     }
   }
 
-  if (requirements.length > 80) {
-    throw new Error(`Reconciliation produced ${requirements.length} requirements, exceeding the 80-item safety limit. The prior baseline was preserved; narrow or correct the candidate rather than silently dropping requirements.`);
-  }
   const renumbered = requirements.map((item, index) => ({
     ...item,
     id: `REQ-${String(index + 1).padStart(3, '0')}`
   }));
   const technologies = new Map<string, string>();
-  for (const item of previous?.approvedTechnologies ?? []) if (!contradictsLockedCorrection(item)) technologies.set(technologyKey(item), item);
+  for (const item of authoritativePrevious?.approvedTechnologies ?? []) if (!contradictsLockedCorrection(item)) technologies.set(technologyKey(item), item);
   for (const item of candidate.approvedTechnologies) if (!contradictsLockedCorrection(item)) technologies.set(technologyKey(item), item);
 
-  let packageManager = candidate.packageManager.trim() || previous?.packageManager.trim() || '';
+  let packageManager = candidate.packageManager.trim() || authoritativePrevious?.packageManager.trim() || '';
   const cumulativeCorrections = correctionTexts.join('\n');
   const pinnedPackageManager = /\b(pnpm@[0-9]+(?:\.[0-9]+){1,2})\b/i.exec(cumulativeCorrections)?.[1];
   if (pinnedPackageManager) packageManager = pinnedPackageManager.toLocaleLowerCase();
@@ -244,20 +272,22 @@ export function reconcileRequirementsBaseline(
     technologies.set('vercel', 'Vercel (provisionally adopted for later phases; current phase remains local only)');
   }
 
-  return {
-    baseline: {
+  const baseline: RequirementsBaseline = {
       version: 2,
-      scope: candidate.scope || previous?.scope || 'Approved requirements for the current planning scope.',
+      scope: candidate.scope || authoritativePrevious?.scope || 'Approved requirements for the current planning scope.',
       requirements: renumbered,
       lockedCorrections,
       approvedTechnologies: [...technologies.values()],
       packageManager,
       requiredMilestones: mergeSimilarStrings(
         candidate.requiredMilestones.filter(item => !contradictsLockedCorrection(item)),
-        (previous?.requiredMilestones ?? []).filter(item => !contradictsLockedCorrection(item))
+        (authoritativePrevious?.requiredMilestones ?? []).filter(item => !contradictsLockedCorrection(item))
       ),
-      deferred: mergeSimilarStrings(candidate.deferred, previous?.deferred ?? [])
-    },
+      deferred: mergeSimilarStrings(candidate.deferred, authoritativePrevious?.deferred ?? [])
+    };
+  if (requirements.length > requirementsSafetyLimit) throw new RequirementsCapacityError('reconciliation', requirements.length, baseline);
+  return {
+    baseline,
     preservedRequirements
   };
 }
@@ -380,14 +410,20 @@ ${source.slice(0, 180_000)}`;
   let firstFailure = parsed === undefined ? 'The candidate was not parseable JSON.' : '';
   if (parsed !== undefined) {
     try { return normalizeBaseline(parsed); }
-    catch (error) { firstFailure = error instanceof Error ? error.message : String(error); }
+    catch (error) {
+      if (isRequirementsCapacityError(error)) throw error;
+      firstFailure = error instanceof Error ? error.message : String(error);
+    }
   }
   const repairPrompt = `The prior local extraction failed deterministic validation: ${firstFailure}\n\nConvert the candidate below into one valid JSON object matching the supplied schema. Preserve every supported current-scope requirement, milestone, entry decision, exit decision, acceptance item, and deferral. Use only as many rows as needed, up to 80. Remove duplicates and contradictions; never pad the list. Return JSON only with no commentary or Markdown fences.\n\nCANDIDATE OUTPUT:\n${firstOutput.slice(0, 100_000)}`;
   const repairedOutput = await generateRequirementsJson(model, repairPrompt, signal, 12_000);
   parsed = parseGeneratedJson(repairedOutput);
   if (parsed === undefined) throw new Error('Ollama returned requirements that were not valid JSON after one automatic local repair attempt. The saved baseline was not changed.');
   try { return normalizeBaseline(parsed); }
-  catch (error) { throw new Error(`Ollama returned a baseline that still failed deterministic quality checks after one automatic local repair attempt. The saved baseline was not changed. ${error instanceof Error ? error.message : String(error)}`); }
+  catch (error) {
+    if (isRequirementsCapacityError(error)) throw error;
+    throw new Error(`Ollama returned a baseline that still failed deterministic quality checks after one automatic local repair attempt. The saved baseline was not changed. ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 export async function createLocalWorkStarter(

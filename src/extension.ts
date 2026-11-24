@@ -1,33 +1,35 @@
 import * as vscode from 'vscode';
-import { canAutoApplyFinalCanonicalCorrection, isCompletedPrerequisiteState, normalizePrerequisitePlanningDecision, planningCheckpointInteractionType } from './prerequisite-state';
+import { attachPrerequisiteReport, canAutoApplyFinalCanonicalCorrection, inferWorkflowPurpose, isCompletedPrerequisiteState, normalizePrerequisitePlanningDecision, parentOutcomeAfterPrerequisite, planningCheckpointInteractionType, prerequisiteEvidenceChanged, prerequisitePublicationPrefix, resolvePendingOwnerWork, type PrerequisiteReport, type WorkflowPurpose } from './prerequisite-state';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as readline from 'node:readline';
 import { homedir } from 'node:os';
 import { MobileBridge, type MobileInfo, type MobileSettings, type MobileSnapshot } from './mobile';
-import { baselineDigest, baselineMarkdown, checkPlanPreservation, createLocalWorkStarter, extractRequirements, listOllamaModels, normalizeBaseline, planContractInstructions, preservationMarkdown, reconcileRequirementsBaseline, type RequirementsBaseline } from './requirements';
+import { baselineDigest, baselineMarkdown, checkPlanPreservation, createLocalWorkStarter, extractRequirements, isRequirementsCapacityError, listOllamaModels, normalizeBaseline, parseLockedCorrectionsMarkdown, planContractInstructions, preservationMarkdown, reconcileRequirementsBaseline, type RequirementsBaseline } from './requirements';
 import { waitForChildExit } from './process-lifecycle';
-import { acceptanceOutcome, completedAcceptanceNeedsReopen, hasUnresolvedAcceptanceTemplate, requiresExplicitImplementationApproval, siblingEvidenceSatisfiesProcedure } from './workflow-safety';
+import { hasPendingOwnerApproval, validatePrerequisiteResults, acceptanceOutcome, completedAcceptanceNeedsReopen, hasUnresolvedAcceptanceTemplate, humanPrerequisiteProcedure, humanPrerequisiteResponseTemplate, requiresExplicitImplementationApproval, siblingEvidenceSatisfiesProcedure } from './workflow-safety';
+import { parseClaudeModelCatalog, parseModelServicePage, type AccountModel, type ClaudeModel } from './model-discovery';
+import { explicitlyWritablePaths, applyBoundedDocumentDelivery, captureWorktreeBaseline, type DocumentDelivery, type WorktreeBaseline } from './document-delivery';
 
 type Provider = 'claude' | 'codex';
 type Role = { provider: Provider; model: string; effort: string };
 type ClaudeSessionPolicy = 'checkpoint' | 'continuous' | 'fresh';
 type Preset = { name: string; planner: Role; reviewer: Role; orchestrator: Role; implementer: Role; codeReviewer: Role; claudeExploreModel: string; claudeSessionPolicy: ClaudeSessionPolicy; requirementsGuard: boolean; ollamaModel: string; localPlanningStarter: boolean; localImplementationStarter: boolean; secondarySolApproval: boolean; secondaryApprovalModel: string; secondaryDecisionDelegation: boolean; maxRounds: number; maxCodeRounds: number };
-type Decision = 'REVISE' | 'ROADMAP_READY' | 'READY_TO_CODE' | 'PHASE_COMPLETE' | 'SPLIT' | 'WAITING_FOR_PREREQUISITE' | 'PREREQUISITE_COMPLETE' | 'NEEDS_HUMAN' | 'NEEDS_MORE_PLANNING' | 'STOP';
+type Decision = 'REVISE' | 'ROADMAP_READY' | 'READY_TO_CODE' | 'DOCUMENTS_READY' | 'PHASE_COMPLETE' | 'PREREQUISITE_SATISFIED' | 'SPLIT' | 'WAITING_FOR_PREREQUISITE' | 'PREREQUISITE_COMPLETE' | 'NEEDS_HUMAN' | 'NEEDS_MORE_PLANNING' | 'STOP';
 type ResumeStage = 'planning' | 'reviewing' | 'deciding';
 type CodeDecision = 'FIX' | 'CODE_READY' | 'NEEDS_HUMAN' | 'NEEDS_MORE_CODE' | 'STOP';
 type CodeResumeStage = 'implementing' | 'code_reviewing' | 'code_deciding';
 type SplitPhase = { title: string; objective: string; dependsOn: string[] };
-type Prerequisite = { title: string; reason: string; resumeWhen: string };
+type Prerequisite = { title: string; reason: string; resumeWhen: string; workType?: WorkflowPurpose; pendingAfter?: string[] };
 type PlanningFinding = { id: string; summary: string; source: string; severity: 'High' | 'Medium' | 'Low'; affectedPhase: string; canonicalLocation: string; closureCondition: string; status: 'open' | 'resolved' | 'deferred' };
 type PlanningLedger = { objective: string; inScope: string[]; lockedDecisions: string[]; unresolvedFindings: string[]; deferred: string[]; findings?: PlanningFinding[] };
 type GuidanceEntry = { createdAt: string; beforeRound: number; text: string; artifactPath: string };
 type RoadmapAcceptance = { status: 'provisional'; acceptedAt: string; notes: string; artifactPath: string };
 type RequirementsCorrection = { createdAt: string; text: string };
-type RequirementsGuardState = { model: string; status: 'draft' | 'approved' | 'declined'; baselinePath: string; baselineMarkdownPath: string; digest: string; approvedAt?: string; declinedAt?: string; declineReason?: string; sourcePaths: string[]; corrections?: RequirementsCorrection[]; correctionsPath?: string; candidateHistoryPaths?: string[]; autoPreservedRequirements?: number; preservationFailures: number; architecturalReviews: number; finalCanonicalCorrectionUsed?: boolean; humanDirectedPasses?: number };
-type DecisionResult = { decision: Decision; detail: string; plannerPrompt: string; phases: SplitPhase[]; prerequisite?: Prerequisite; planningLedger?: PlanningLedger; workflowName?: string };
+type RequirementsGuardState = { model: string; status: 'draft' | 'approved' | 'declined'; baselinePath: string; baselineMarkdownPath: string; digest: string; approvedAt?: string; declinedAt?: string; declineReason?: string; declinedFallbackAt?: string; sourcePaths: string[]; corrections?: RequirementsCorrection[]; correctionsPath?: string; candidateHistoryPaths?: string[]; autoPreservedRequirements?: number; preservationFailures: number; architecturalReviews: number; finalCanonicalCorrectionUsed?: boolean; humanDirectedPasses?: number; failureKind?: 'capacity' | 'generation'; failureOperation?: 'extraction' | 'reconciliation'; failureRequirementCount?: number; failureEvidencePath?: string; failedCandidatePath?: string };
+type DecisionResult = { decision: Decision; detail: string; plannerPrompt: string; phases: SplitPhase[]; prerequisite?: Prerequisite; planningLedger?: PlanningLedger; workflowName?: string; documentDelivery?: DocumentDelivery; resolvedPendingAfter?: string[] };
 type PlanningAuditRecommendation = 'TARGETED_REVISION' | 'READY' | 'NEEDS_HUMAN' | 'RETURN_TO_PARENT' | 'STOP';
 type PlanningCheckpointAudit = { recommendation: PlanningAuditRecommendation; summary: string; confirmedFindings: string[]; rejectedFindings: string[]; plannerPrompt: string };
 type SecondaryApprovalReview = { decision: 'APPROVE' | 'REVISE' | 'NEEDS_HUMAN'; summary: string; findings: string[]; correctionPrompt: string };
@@ -42,12 +44,12 @@ type CodeDecisionResult = {
   responseTemplate: string;
   humanAcceptanceRequired: boolean;
 };
-type RunRecord = { id: string; task: string; originalTask?: string; workflowName?: string; phasePath?: number[]; taskFilePath?: string; humanInput?: string; implementationApprovalGuidance?: string; implementationRequiresHumanApproval?: boolean; guidanceEntries?: GuidanceEntry[]; roadmapAcceptance?: RoadmapAcceptance; sourcePlanPath?: string; requirementsSourcePath?: string; requirementsGuard?: RequirementsGuardState; claudeSessions?: { planner?: string; plannerStartedRound?: number; implementer?: string; implementerStartedRound?: number }; parentRunId?: string; returnToRunFile?: string; splitPhaseIndex?: number; splitPhaseTitle?: string; completedPhaseIndexes?: number[]; finalPlanIndexPath?: string; baselinePlanPath?: string; workingDraftPath?: string; approvedPlanPath?: string; splitPhases?: SplitPhase[]; prerequisite?: Prerequisite; orchestratorDirection?: string; planningLedger?: PlanningLedger; remediationOfRunId?: string; supersededByRemediationRunId?: string; preset: Preset; stage: string; resumeStage?: ResumeStage; round: number; decision?: Decision; detail?: string; codeRound?: number; codeStage?: string; codeResumeStage?: CodeResumeStage; codeDecision?: CodeDecision; codeDetail?: string; codeDirection?: string; secondaryCodeApprovalStatus?: 'pending' | 'approved'; secondaryCodeApprovalRound?: number; verificationRetryCount?: number; additionalDirectories?: string[]; acceptanceStatus?: 'pending' | 'failed' | 'complete'; acceptanceInstructions?: string; pendingHumanActions?: string[]; acceptanceResponseTemplate?: string; acceptanceResultsPath?: string; files: string[] };
+type RunRecord = { ownerDocumentPaths?: string[]; id: string; task: string; originalTask?: string; workflowName?: string; workflowKind?: 'root' | 'split-phase' | 'prerequisite' | 'remediation'; workflowPurpose?: WorkflowPurpose; phasePath?: number[]; prerequisitePath?: number[]; prerequisiteParentRunId?: string; prerequisiteOrdinal?: number; prerequisiteReports?: PrerequisiteReport[]; prerequisiteCompletionReport?: PrerequisiteReport; pendingAfterPrerequisite?: string[]; resumeAfterPrerequisite?: ResumeStage; lastPrerequisiteSubmission?: string; lastPrerequisiteRepositoryDigest?: string; startingState?: WorktreeBaseline; taskFilePath?: string; humanInput?: string; implementationApprovalGuidance?: string; implementationRequiresHumanApproval?: boolean; guidanceEntries?: GuidanceEntry[]; roadmapAcceptance?: RoadmapAcceptance; sourcePlanPath?: string; requirementsSourcePath?: string; requirementsGuard?: RequirementsGuardState; claudeSessions?: { planner?: string; plannerStartedRound?: number; implementer?: string; implementerStartedRound?: number }; parentRunId?: string; returnToRunFile?: string; splitPhaseIndex?: number; splitPhaseTitle?: string; completedPhaseIndexes?: number[]; finalPlanIndexPath?: string; baselinePlanPath?: string; workingDraftPath?: string; approvedPlanPath?: string; splitPhases?: SplitPhase[]; prerequisite?: Prerequisite; orchestratorDirection?: string; planningLedger?: PlanningLedger; remediationOfRunId?: string; supersededByRemediationRunId?: string; preset: Preset; stage: string; resumeStage?: ResumeStage; round: number; decision?: Decision; detail?: string; codeRound?: number; codeStage?: string; codeResumeStage?: CodeResumeStage; codeDecision?: CodeDecision; codeDetail?: string; codeDirection?: string; secondaryCodeApprovalStatus?: 'pending' | 'approved'; secondaryCodeApprovalRound?: number; verificationRetryCount?: number; additionalDirectories?: string[]; acceptanceStatus?: 'pending' | 'failed' | 'complete'; acceptanceInstructions?: string; pendingHumanActions?: string[]; acceptanceResponseTemplate?: string; acceptanceResultsPath?: string; files: string[] };
 type ResumeContext = { runDir: string; record: RunRecord; stage: ResumeStage; round: number; plan?: string; review?: string; orchestratorDirection?: string };
+type StartRelationship = { ownerDocumentPaths?: string[]; workflowKind: RunRecord['workflowKind']; workflowPurpose?: WorkflowPurpose; prerequisiteParentRunId?: string; prerequisitePath?: number[]; prerequisiteOrdinal?: number; pendingAfterPrerequisite?: string[]; resumeAfterPrerequisite?: ResumeStage };
 type SplitContext = { runDir: string; record: RunRecord; phases: SplitPhase[]; plan?: string };
 type CodeContext = { runDir: string; record: RunRecord; stage: CodeResumeStage; round: number; plan: string; implementation?: string; review?: string; direction?: string };
-type Interaction = { type: 'needsInput' | 'codeNeedsInput' | 'acceptancePending' | 'prerequisitePending' | 'prerequisiteComplete' | 'childLimit' | 'failed' | 'morePlanning' | 'moreCode' | 'verificationRequired' | 'readyToCode' | 'codeReady' | 'requirementsApproval'; text: string; details?: string; responseTemplate?: string; finalCorrection?: boolean; requirementsGuardAttached?: boolean; requirementsGuardLimit?: boolean; canReopen?: boolean } | { type: 'nextPhase'; text: string; phase: SplitPhase; canReopen?: boolean } | { type: 'split'; text: string; phases: SplitPhase[]; roadmapReady?: boolean; roadmapAccepted?: boolean; roadmapNotes?: string };
-type AccountModel = { id: string; displayName: string; isDefault: boolean; defaultReasoningEffort?: string; supportedReasoningEfforts: string[] };
+type Interaction = { type: 'needsInput' | 'codeNeedsInput' | 'acceptancePending' | 'prerequisitePending' | 'prerequisiteComplete' | 'childLimit' | 'failed' | 'morePlanning' | 'moreCode' | 'verificationRequired' | 'readyToCode' | 'codeReady' | 'requirementsApproval' | 'requirementsFallback'; text: string; details?: string; responseTemplate?: string; humanProcedure?: boolean; finalCorrection?: boolean; requirementsGuardAttached?: boolean; requirementsGuardLimit?: boolean; canReopen?: boolean } | { type: 'nextPhase'; text: string; phase: SplitPhase; canReopen?: boolean } | { type: 'split'; text: string; phases: SplitPhase[]; roadmapReady?: boolean; roadmapAccepted?: boolean; roadmapNotes?: string };
 const presetsKey = 'presets.v1';
 const lastRunKey = 'lastRunFile.v1';
 const mobileEnabledKey = 'mobile.enabled.v1';
@@ -331,8 +333,15 @@ async function discoverCodexModels(): Promise<AccountModel[]> {
     const lines = readline.createInterface({ input: child.stdout });
     let stderr = '';
     let settled = false;
+    let requestId = 2;
+    let pendingModelRequestId = 0;
+    const serviceModels: AccountModel[] = [];
     const timer = setTimeout(() => finish(new Error('Timed out while asking Codex for available models.')), 15000);
     const send = (message: unknown) => child.stdin.write(`${JSON.stringify(message)}\n`);
+    const requestModels = (cursor?: string) => {
+      pendingModelRequestId = requestId++;
+      send({ method: 'model/list', id: pendingModelRequestId, params: { cursor: cursor ?? null, limit: 100, includeHidden: false } });
+    };
     const finish = (error?: Error, models?: AccountModel[]) => {
       if (settled) return;
       settled = true;
@@ -352,27 +361,39 @@ async function discoverCodexModels(): Promise<AccountModel[]> {
         if (message.id === 1) {
           if (message.error) return finish(new Error(message.error.message ?? JSON.stringify(message.error)));
           send({ method: 'initialized', params: {} });
-          send({ method: 'model/list', id: 2, params: { limit: 100, includeHidden: false } });
+          requestModels();
         }
-        if (message.id === 2) {
+        if (message.id === pendingModelRequestId) {
           if (message.error) return finish(new Error(message.error.message ?? JSON.stringify(message.error)));
-          const models = Array.isArray(message.result?.data) ? message.result.data.map((model: any) => ({
-            id: String(model.model ?? model.id),
-            displayName: String(model.displayName ?? model.model ?? model.id),
-            isDefault: model.isDefault === true,
-            defaultReasoningEffort: model.defaultReasoningEffort ? String(model.defaultReasoningEffort) : undefined,
-            supportedReasoningEfforts: Array.isArray(model.supportedReasoningEfforts)
-              ? model.supportedReasoningEfforts.map((effort: any) => String(effort.reasoningEffort))
-              : []
-          })) : [];
-          finish(undefined, models);
+          serviceModels.push(...parseModelServicePage(message.result?.data));
+          const nextCursor = typeof message.result?.nextCursor === 'string' && message.result.nextCursor
+            ? message.result.nextCursor
+            : undefined;
+          if (nextCursor) requestModels(nextCursor);
+          else finish(undefined, [...new Map(serviceModels.map(model => [model.id, model])).values()]);
         }
       } catch (error) {
         finish(error instanceof Error ? error : new Error(String(error)));
       }
     });
-    send({ method: 'initialize', id: 1, params: { clientInfo: { name: 'plan_review_workflow', title: 'CodeFlow Conductor', version: '0.47.5' } } });
+    send({ method: 'initialize', id: 1, params: { clientInfo: { name: 'plan_review_workflow', title: 'CodeFlow Conductor', version: '0.47.18' } } });
   });
+}
+
+async function discoverClaudeModels(): Promise<ClaudeModel[]> {
+  const catalogDir = path.join(homedir(), '.claude', 'cache', 'model-catalog');
+  const entries = (await fs.readdir(catalogDir, { withFileTypes: true }))
+    .filter(entry => entry.isFile() && entry.name.endsWith('.json'));
+  const candidates = await Promise.all(entries.map(async entry => ({
+    path: path.join(catalogDir, entry.name),
+    modifiedAt: (await fs.stat(path.join(catalogDir, entry.name))).mtimeMs
+  })));
+  candidates.sort((left, right) => right.modifiedAt - left.modifiedAt);
+  for (const candidate of candidates) {
+    const models = parseClaudeModelCatalog(await fs.readFile(candidate.path, 'utf8'));
+    if (models.length) return models;
+  }
+  return [];
 }
 
 function parseJsonResponse(raw: string, errorMessage: string): unknown {
@@ -393,7 +414,7 @@ function parseDecision(raw: string): DecisionResult {
   const value = parseJsonResponse(raw, 'Orchestrator did not return valid JSON. Inspect its saved response.');
   if (!value || typeof value !== 'object') throw new Error('Orchestrator response is not an object.');
   const data = value as Record<string, unknown>;
-  const allowed: Decision[] = ['REVISE', 'ROADMAP_READY', 'READY_TO_CODE', 'PHASE_COMPLETE', 'SPLIT', 'WAITING_FOR_PREREQUISITE', 'PREREQUISITE_COMPLETE', 'NEEDS_HUMAN', 'NEEDS_MORE_PLANNING', 'STOP'];
+  const allowed: Decision[] = ['REVISE', 'ROADMAP_READY', 'READY_TO_CODE', 'DOCUMENTS_READY', 'PHASE_COMPLETE', 'PREREQUISITE_SATISFIED', 'SPLIT', 'WAITING_FOR_PREREQUISITE', 'PREREQUISITE_COMPLETE', 'NEEDS_HUMAN', 'NEEDS_MORE_PLANNING', 'STOP'];
   if (!allowed.includes(data.decision as Decision) || typeof data.detail !== 'string') throw new Error('Orchestrator response needs a decision and detail.');
   const phases = Array.isArray(data.phases) ? data.phases.flatMap((item): SplitPhase[] => {
     if (!item || typeof item !== 'object') return [];
@@ -418,10 +439,15 @@ function parseDecision(raw: string): DecisionResult {
     const title = String(item.title ?? '').trim();
     const reason = String(item.reason ?? data.detail).trim();
     const resumeWhen = String(item.resumeWhen ?? '').trim();
-    if (title) prerequisite = { title, reason, resumeWhen };
+    const workTypeValue = String(item.workType ?? '').trim();
+    const workType = ['implementation', 'planning-document-delivery', 'verification', 'external-evidence'].includes(workTypeValue)
+      ? workTypeValue as WorkflowPurpose
+      : inferWorkflowPurpose(`${title}\n${reason}\n${resumeWhen}`);
+    const pendingAfter = Array.isArray(item.pendingAfter) ? item.pendingAfter.map(String).map(value => value.trim()).filter(Boolean) : [];
+    if (title) prerequisite = { title, reason, resumeWhen, workType, pendingAfter };
   }
   if (data.decision === 'WAITING_FOR_PREREQUISITE' && !prerequisite) {
-    prerequisite = { title: 'External prerequisite', reason: data.detail, resumeWhen: 'Resume this phase after the prerequisite is complete and its evidence is available.' };
+    prerequisite = { title: 'External prerequisite', reason: data.detail, resumeWhen: 'Resume this phase after the prerequisite is complete and its evidence is available.', workType: inferWorkflowPurpose(data.detail), pendingAfter: [] };
   }
   let planningLedger: PlanningLedger | undefined;
   if (data.planningLedger && typeof data.planningLedger === 'object') {
@@ -457,7 +483,27 @@ function parseDecision(raw: string): DecisionResult {
     };
   }
   const workflowName = typeof data.workflowName === 'string' ? data.workflowName.trim().slice(0, 100) : '';
-  return { decision: data.decision as Decision, detail: data.detail, plannerPrompt, phases, prerequisite, planningLedger, workflowName: workflowName || undefined };
+  let documentDelivery: DocumentDelivery | undefined;
+  if (data.documentDelivery && typeof data.documentDelivery === 'object') {
+    const delivery = data.documentDelivery as Record<string, unknown>;
+    const plan = delivery.planDocument && typeof delivery.planDocument === 'object' ? delivery.planDocument as Record<string, unknown> : undefined;
+    const planPath = String(plan?.path ?? '').trim();
+    const planDocument = planPath ? { path: planPath, startHeading: String(plan?.startHeading ?? '').trim() || undefined } : undefined;
+    const replacements = Array.isArray(delivery.replacements) ? delivery.replacements.flatMap((input): NonNullable<DocumentDelivery['replacements']> => {
+      if (!input || typeof input !== 'object') return [];
+      const item = input as Record<string, unknown>;
+      const replacementPath = String(item.path ?? '').trim();
+      const before = String(item.before ?? '');
+      const after = String(item.after ?? '');
+      return replacementPath && before ? [{ path: replacementPath, before, after }] : [];
+    }) : [];
+    if (planDocument || replacements.length) documentDelivery = { planDocument, replacements };
+  }
+  if (data.decision === 'DOCUMENTS_READY' && !documentDelivery) throw new Error('DOCUMENTS_READY requires a bounded documentDelivery object.');
+  const resolvedPendingAfter = Array.isArray(data.resolvedPendingAfter)
+    ? data.resolvedPendingAfter.map(String).map(item => item.trim()).filter(Boolean)
+    : [];
+  return { decision: data.decision as Decision, detail: data.detail, plannerPrompt, phases, prerequisite, planningLedger, workflowName: workflowName || undefined, documentDelivery, resolvedPendingAfter };
 }
 
 function parsePlanningCheckpointAudit(raw: string): PlanningCheckpointAudit {
@@ -516,11 +562,19 @@ function delegatedDecisionMarkdown(title: string, model: string, result: Delegat
 }
 
 function delegatedDecisionPrompt(question: string, context: string): string {
-  return `Act as the owner's delegated decision reviewer for this workflow checkpoint. Do not edit files. Reply with ONLY JSON: {"decision":"RESOLVED|HUMAN_REQUIRED","answer":"the decision supported by existing authority, or empty","rationale":"specific supporting evidence or why delegation is unsafe","nextInstruction":"bounded instruction for the planner or implementer, or empty"}. Choose RESOLVED only when the answer follows directly from the approved task, requirements, plan, prior owner guidance, or concrete repository evidence. Do not invent a product preference or new requirement. Choose HUMAN_REQUIRED when the checkpoint requires credentials, private information unavailable in the repository, destructive or irreversible authorization, legal or financial consent, an observation from a UI/device/native session, execution of a human-only acceptance procedure, or a product choice with no recorded owner preference. Never claim that a command, UI flow, or acceptance check passed unless recorded evidence proves it.\n\nQuestion or checkpoint:\n${question}\n\nWorkflow context:\n${context}`;
+  return `Act as the owner's delegated decision reviewer for this workflow checkpoint. The owner explicitly enabled this delegation. Do not edit files. Reply with ONLY JSON: {"decision":"RESOLVED|HUMAN_REQUIRED","answer":"the decision supported by existing authority, or empty","rationale":"specific supporting evidence or why delegation is unsafe","nextInstruction":"bounded instruction for the planner or implementer, or empty"}. Choose RESOLVED when the answer follows directly from the approved task, requirements, plan, prior owner guidance, or concrete repository evidence. This delegated authority includes approving a bounded plan or operator checklist and authorizing reversible, in-scope read-only inspection or documentation work. Do not circularly require an earlier owner approval when this checkpoint exists to approve that bounded work. If later execution still requires the owner's signed-in account, UI/device observations, or a human-only acceptance procedure, approve the plan when otherwise sound while preserving a later human checkpoint for the actual actions and evidence. Do not claim those future actions passed. Do not invent a product preference or new requirement. Choose HUMAN_REQUIRED only when the current decision itself requires credentials, private information unavailable in the repository, destructive or irreversible authorization, legal or financial consent, a current observation from a UI/device/native session, execution of a human-only acceptance procedure now, or a product choice with no recorded owner preference. Never claim that a command, UI flow, or acceptance check passed unless recorded evidence proves it.\n\nQuestion or checkpoint:\n${question}\n\nWorkflow context:\n${context}`;
 }
 
 function requiresDirectHumanAction(text: string): boolean {
   return /COMMAND_BLOCKED|password|passcode|secret|credential|API key|sign[ -]?in|log[ -]?in|permission (?:denied|required)|approval required|destructive|irreversible|human-only|operator checklist|interactive (?:desktop|app|session)|native (?:macOS|Windows|Linux)|UI\/device|screenshot|camera|microphone|physical device|click (?:the|a)|open the app|run (?:the following|this exact|`)|record (?:the|your) observations?/i.test(text);
+}
+
+function planningProgress(round: number, total: number, step: string): string {
+  return `Planning — round ${round} of ${total}\n${step}`;
+}
+
+function implementationProgress(round: number, total: number, step: string): string {
+  return `Implementation — round ${round} of ${total}\n${step}`;
 }
 
 function explicitUnmetPrerequisite(plan: string): Prerequisite | undefined {
@@ -820,6 +874,11 @@ async function readRequirementsBaseline(record: RunRecord): Promise<Requirements
   catch { return; }
 }
 
+function hasRequirementsCapacityFailure(record: RunRecord): boolean {
+  return record.requirementsGuard?.failureKind === 'capacity'
+    || /\b(?:reconciliation produced|ollama returned|generated extraction|generated reconciliation)\b[\s\S]{0,180}\bexceeding the 80-item/i.test(`${record.detail ?? ''}`);
+}
+
 async function detectRepositoryPackageManager(workspace: string): Promise<string | undefined> {
   if (!workspace) return;
   try {
@@ -894,7 +953,8 @@ async function persistWorkingDraft(cwd: string, record: RunRecord, plan: string 
   const runDir = path.join(cwd, '.review-workflow', 'runs', record.id);
   await fs.mkdir(runDir, { recursive: true });
   const file = path.join(runDir, 'working-plan.md');
-  const provenance = `<!-- Plan Review Workflow\nRun: ${record.id}${record.parentRunId ? `\nParent run: ${record.parentRunId}` : ''}\nStatus: ${status}\nUpdated: ${new Date().toISOString()}\n-->`;
+  const parentLink = record.parentRunId ?? record.prerequisiteParentRunId;
+  const provenance = `<!-- Plan Review Workflow\nRun: ${record.id}${parentLink ? `\nParent run: ${parentLink}` : ''}${record.workflowKind ? `\nWorkflow kind: ${record.workflowKind}` : ''}\nStatus: ${status}\nUpdated: ${new Date().toISOString()}\n-->`;
   await fs.writeFile(file, `${provenance}\n\n${plan.trim()}\n`, 'utf8');
   record.workingDraftPath = file;
   if (!record.files.includes(file)) record.files.push(file);
@@ -945,7 +1005,7 @@ async function publishApprovedPlan(cwd: string, record: RunRecord, plan: string 
   const planningDir = publishedPlanningDirectory(cwd, record);
   await fs.mkdir(planningDir, { recursive: true });
   const recordedPath = record.approvedPlanPath;
-  const phasePrefix = formatPhasePath(record.phasePath);
+  const phasePrefix = prerequisitePublicationPrefix(record.phasePath, record.prerequisitePath);
   const descriptiveName = record.splitPhaseTitle || record.workflowName || record.task;
   const generatedName = phasePrefix
     ? `${phasePrefix}-${slugify(descriptiveName)}-approved.md`
@@ -953,7 +1013,8 @@ async function publishApprovedPlan(cwd: string, record: RunRecord, plan: string 
   const file = recordedPath && isInsideDirectory(recordedPath, path.join(cwd, 'docs', 'planning'))
     ? recordedPath
     : path.join(planningDir, generatedName);
-  const provenance = `<!-- Plan Review Workflow\nRun: ${record.id}${record.parentRunId ? `\nParent run: ${record.parentRunId}` : ''}\nStatus: ${approvalStatus}\nUpdated: ${new Date().toISOString()}\n-->`;
+  const parentLink = record.parentRunId ?? record.prerequisiteParentRunId;
+  const provenance = `<!-- Plan Review Workflow\nRun: ${record.id}${parentLink ? `\nParent run: ${parentLink}` : ''}${record.workflowKind ? `\nWorkflow kind: ${record.workflowKind}` : ''}\nStatus: ${approvalStatus}\nUpdated: ${new Date().toISOString()}\n-->`;
   await fs.writeFile(file, `${provenance}\n\n${plan.trim()}\n`, 'utf8');
   record.approvedPlanPath = file;
   if (!record.files.includes(file)) record.files.push(file);
@@ -1073,14 +1134,20 @@ async function persistOriginalTask(runDir: string, record: RunRecord): Promise<s
 
 async function persistSplitPlanIndex(cwd: string, parentRunDir: string, parentRecord: RunRecord): Promise<string | undefined> {
   const phases = Array.isArray(parentRecord.splitPhases) ? parentRecord.splitPhases : [];
-  if (!phases.length) return;
   const runsRoot = path.dirname(parentRunDir);
   const children = new Map<number, { record: RunRecord; modified: number }>();
+  const prerequisites: RunRecord[] = [];
   for (const entry of await fs.readdir(runsRoot, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name === parentRecord.id) continue;
     const runFile = path.join(runsRoot, entry.name, 'run.json');
     try {
       const child = JSON.parse(await fs.readFile(runFile, 'utf8')) as RunRecord;
+      const linkedPrerequisite = child.prerequisiteParentRunId === parentRecord.id
+        || (!child.prerequisiteParentRunId && child.returnToRunFile === path.join(parentRunDir, 'run.json'));
+      if (linkedPrerequisite) {
+        prerequisites.push(child);
+        continue;
+      }
       if (child.parentRunId !== parentRecord.id) continue;
       const index = Number.isInteger(child.splitPhaseIndex) ? child.splitPhaseIndex! : phases.findIndex(phase =>
         phase.title === child.splitPhaseTitle || child.task.includes(`Phase: ${phase.title}\n`));
@@ -1103,9 +1170,11 @@ async function persistSplitPlanIndex(cwd: string, parentRunDir: string, parentRe
       // Ignore unrelated or incomplete run directories while building the index.
     }
   }
+  if (!phases.length && !prerequisites.length) return;
+  prerequisites.sort((left, right) => (left.prerequisiteOrdinal ?? 0) - (right.prerequisiteOrdinal ?? 0) || left.id.localeCompare(right.id));
   const planningDir = publishedPlanningDirectory(cwd, parentRecord);
   await fs.mkdir(planningDir, { recursive: true });
-  const phasePrefix = formatPhasePath(parentRecord.phasePath);
+  const phasePrefix = prerequisitePublicationPrefix(parentRecord.phasePath, parentRecord.prerequisitePath);
   const indexName = parentRecord.workflowName
     ? phasePrefix
       ? `${phasePrefix}-phase-overview-${slugify(parentRecord.splitPhaseTitle || parentRecord.task)}.md`
@@ -1113,9 +1182,10 @@ async function persistSplitPlanIndex(cwd: string, parentRunDir: string, parentRe
     : `${slugify(parentRecord.task)}-${parentRecord.id.slice(0, 8)}-approved-plan-index.md`;
   const file = parentRecord.finalPlanIndexPath ?? path.join(planningDir, indexName);
   const lines = [
-    '# Approved implementation plan index',
+    '# Workflow plan index',
     '',
-    `- **Status:** ${children.size === phases.length ? `Complete (${children.size}/${phases.length} phases)` : `Incomplete (${children.size}/${phases.length} phases)`}`,
+    `- **Implementation phases:** ${phases.length ? (children.size === phases.length ? `Complete (${children.size}/${phases.length})` : `Incomplete (${children.size}/${phases.length})`) : 'None'}`,
+    `- **Prerequisites:** ${prerequisites.length} linked (not counted as implementation phases)`,
     `- **Parent workflow:** ${parentRecord.id}`,
     `- **Updated:** ${new Date().toISOString()}`,
     '',
@@ -1135,6 +1205,21 @@ async function persistSplitPlanIndex(cwd: string, parentRunDir: string, parentRe
       `- **Status:** ${child?.stage === 'split_complete' ? 'Completed through nested split' : child ? 'CODE_READY' : 'Not completed'}`,
       `- **Child workflow:** ${child?.id ?? 'None'}`,
       `- **Approved plan used for implementation:** ${relativePlan ? `[${path.basename(planReference!)}](${relativePlan})` : 'Unavailable'}`,
+      ''
+    );
+  }
+  if (prerequisites.length) lines.push('## Prerequisites', '', 'These workflows satisfy gates for this workflow. They do not count as implementation phases.', '');
+  for (const prerequisite of prerequisites) {
+    const planReference = prerequisite.approvedPlanPath ?? prerequisite.finalPlanIndexPath ?? prerequisite.workingDraftPath;
+    const relativePlan = planReference ? path.relative(path.dirname(file), planReference).split(path.sep).join('/') : undefined;
+    lines.push(
+      `### ${prerequisitePublicationPrefix(prerequisite.phasePath, prerequisite.prerequisitePath) || 'Prerequisite'}: ${prerequisite.splitPhaseTitle || prerequisite.task.split('\n')[0]}`,
+      '',
+      `- **Relationship:** prerequisite of ${parentRecord.id}`,
+      `- **Purpose:** ${prerequisite.workflowPurpose ?? inferWorkflowPurpose(prerequisite.task)}`,
+      `- **Status:** ${isCompletedPrerequisiteState(prerequisite) ? 'Complete' : prerequisite.stage}`,
+      `- **Run:** ${prerequisite.id}`,
+      `- **Plan or evidence:** ${relativePlan ? `[${path.basename(planReference!)}](${relativePlan})` : 'Stored in the run only'}`,
       ''
     );
   }
@@ -1170,6 +1255,63 @@ function reportsCompletedPhaseRecheck(detail: string | undefined): boolean {
   const text = detail ?? '';
   return /\b(?:approve and close|phase (?:is|already) complete|already implemented)\b/i.test(text)
     && /\b(?:no unresolved|do not replan|do not reimplement|no further revision|required acceptance .* pass|acceptance .* passed)\b/i.test(text);
+}
+
+function inferPendingAfterPrerequisite(record: RunRecord, plan = ''): string[] {
+  if (record.pendingAfterPrerequisite !== undefined) {
+    return [...new Set([...(record.pendingAfterPrerequisite ?? []), ...(record.prerequisite?.pendingAfter ?? [])].map(item => item.trim()).filter(Boolean))];
+  }
+  const explicit = record.prerequisite?.pendingAfter ?? [];
+  const pending = [...explicit];
+  const source = `${record.originalTask ?? record.task}\n${plan}`;
+  if (/\bopen questions?\b/i.test(source) && !pending.some(item => /open questions?/i.test(item))) {
+    pending.push('Answer the plan’s open owner questions.');
+  }
+  if (/\b(?:until|before|requires?).{0,80}\b(?:owner|human|user).{0,40}\bapprov|\bwrite no code until i approve|\bimplementation requires.*approval/i.test(source)
+    && !pending.some(item => /approv/i.test(item))) {
+    pending.push('Give explicit owner approval before feature implementation.');
+  }
+  return [...new Set(pending.map(item => item.trim()).filter(Boolean))];
+}
+
+async function prerequisiteRepositoryDigest(cwd: string): Promise<string> {
+  const baseline = await captureWorktreeBaseline(cwd);
+  return createHash('sha256').update(JSON.stringify({
+    head: baseline.head,
+    indexDigest: baseline.indexDigest,
+    dirtyPaths: baseline.dirtyPaths,
+    statusPaths: baseline.statusPaths,
+  })).digest('hex');
+}
+
+async function persistPrerequisiteCompletionReport(runDir: string, record: RunRecord): Promise<PrerequisiteReport> {
+  if (record.prerequisiteCompletionReport) return record.prerequisiteCompletionReport;
+  const evidencePaths = [...new Set([
+    record.acceptanceResultsPath,
+    record.approvedPlanPath,
+    record.workingDraftPath,
+    ...record.files.filter(file => /(?:acceptance|result|evidence|verification|decision)\.(?:md|json)$/i.test(file)),
+  ].filter((file): file is string => Boolean(file)))];
+  const summary = record.codeDetail || record.detail || 'The prerequisite workflow completed with its recorded evidence.';
+  const completedAt = new Date().toISOString();
+  const digest = createHash('sha256').update(JSON.stringify({ sourceRunId: record.id, purpose: record.workflowPurpose, summary, evidencePaths })).digest('hex');
+  const report: PrerequisiteReport = {
+    reportId: `${record.id}:${digest.slice(0, 16)}`,
+    sourceRunId: record.id,
+    completedAt,
+    purpose: record.workflowPurpose ?? inferWorkflowPurpose(record.task),
+    outcome: 'complete',
+    summary,
+    evidencePaths,
+    digest,
+  };
+  const jsonFile = path.join(runDir, 'prerequisite-completion-report.json');
+  const markdownFile = path.join(runDir, 'prerequisite-completion-report.md');
+  await fs.writeFile(jsonFile, JSON.stringify(report, null, 2), 'utf8');
+  await fs.writeFile(markdownFile, `# Prerequisite completion report\n\n- Source run: ${report.sourceRunId}\n- Purpose: ${report.purpose}\n- Completed: ${report.completedAt}\n- Digest: ${report.digest}\n\n## Result\n\n${report.summary}\n\n## Evidence\n\n${report.evidencePaths.length ? report.evidencePaths.map(file => `- ${file}`).join('\n') : '- No separate evidence file was recorded.'}\n`, 'utf8');
+  record.prerequisiteCompletionReport = report;
+  for (const file of [jsonFile, markdownFile]) if (!record.files.includes(file)) record.files.push(file);
+  return report;
 }
 
 function markPrerequisiteComplete(record: RunRecord): void {
@@ -1260,15 +1402,19 @@ class WorkflowView implements vscode.WebviewViewProvider {
           this.sendMobileInfo();
         }
         if (message.type === 'refreshModels') {
-          this.post({ type: 'modelStatus', text: 'Checking models available to this Codex account…' });
-          try {
-            const models = await discoverCodexModels();
-            this.accountModels = models;
-            this.post({ type: 'models', models });
-            this.post({ type: 'modelStatus', text: models.length ? `${models.length} Codex models available for this account.` : 'Codex returned no picker-visible models.' });
-          } catch (error) {
-            this.post({ type: 'modelStatus', text: `Could not load Codex models: ${friendlyError(error)}` });
-          }
+          this.post({ type: 'modelStatus', text: 'Checking models available to your Codex and Claude accounts…' });
+          const [codexResult, claudeResult] = await Promise.allSettled([discoverCodexModels(), discoverClaudeModels()]);
+          const status: string[] = [];
+          if (codexResult.status === 'fulfilled') {
+            this.accountModels = codexResult.value;
+            this.post({ type: 'models', models: codexResult.value });
+            status.push(`${codexResult.value.length} Codex models`);
+          } else status.push(`Codex unavailable: ${friendlyError(codexResult.reason)}`);
+          if (claudeResult.status === 'fulfilled') {
+            this.post({ type: 'claudeModels', models: claudeResult.value });
+            status.push(`${claudeResult.value.length} versioned Claude models`);
+          } else status.push(`Claude catalog unavailable: ${friendlyError(claudeResult.reason)}`);
+          this.post({ type: 'modelStatus', text: status.join(' · ') });
         }
         if (message.type === 'save') {
           const preset = validatePreset(message.preset);
@@ -1336,6 +1482,7 @@ class WorkflowView implements vscode.WebviewViewProvider {
         }
         if (message.type === 'approveRequirements') await this.approveRequirementsBaseline();
         if (message.type === 'declineRequirements') await this.declineRequirementsBaseline(String(message.humanInput ?? '').trim());
+        if (message.type === 'continueWithoutGeneratedBaseline') await this.declineRequirementsBaseline('The optional generated baseline was not accepted. Continue from the authoritative task, selected specification, owner decisions, and parent context without treating generated extraction as an operative contract.');
         if (message.type === 'regenerateRequirements') {
           if (!this.pendingRequirements) throw new Error('Open the requirements baseline checkpoint again before regenerating it.');
           const pending = this.pendingRequirements;
@@ -1392,9 +1539,7 @@ class WorkflowView implements vscode.WebviewViewProvider {
         if (message.type === 'completeAcceptance') await this.completeAcceptance(String(message.humanInput ?? '').trim());
         if (message.type === 'reopenCompletedPhase') await this.reopenCompletedPhase(String(message.humanInput ?? '').trim());
         if (message.type === 'recheckPrerequisite') {
-          if (!this.pendingPrerequisite) throw new Error('Open the waiting phase again before rechecking its prerequisite.');
-          const pending = this.pendingPrerequisite;
-          await this.start(pending.record.task, pending.record.preset, String(message.humanInput ?? '').trim(), { ...pending, stage: 'reviewing', review: undefined });
+          await this.recheckWaitingPrerequisite(String(message.humanInput ?? '').trim());
         }
         if (message.type === 'startPrerequisiteWorkflow') await this.startPrerequisiteWorkflow();
         if (message.type === 'acceptRoadmap') await this.acceptRoadmap(String(message.humanInput ?? '').trim());
@@ -1696,10 +1841,20 @@ class WorkflowView implements vscode.WebviewViewProvider {
         ? `CUMULATIVE LOCKED CORRECTIONS — every entry remains authoritative. Apply all entries together and do not trade one correction for another:\n\n${corrections.map((item, index) => `LOCK-${String(index + 1).padStart(3, '0')} (${item.createdAt}):\n${item.text}`).join('\n\n---\n\n')}\n\n---\n\n`
         : '';
       const extractionSource = `${cumulativeCorrectionSource}${source.text}`;
-      const candidate = await extractRequirements(model, extractionSource, this.controller?.signal);
-      const repositoryPackageManager = await detectRepositoryPackageManager(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '');
-      if (repositoryPackageManager) candidate.packageManager = repositoryPackageManager;
-      const { baseline, preservedRequirements } = reconcileRequirementsBaseline(previousBaseline, candidate, corrections);
+      let candidate: RequirementsBaseline;
+      let baseline: RequirementsBaseline;
+      let preservedRequirements: number;
+      try {
+        candidate = await extractRequirements(model, extractionSource, this.controller?.signal);
+        const repositoryPackageManager = await detectRepositoryPackageManager(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '');
+        if (repositoryPackageManager) candidate.packageManager = repositoryPackageManager;
+        ({ baseline, preservedRequirements } = reconcileRequirementsBaseline(previousBaseline, candidate, corrections, {
+          preservePreviousRequirements: record.requirementsGuard?.status === 'approved'
+        }));
+      } catch (error) {
+        if (this.controller?.signal.aborted) throw error;
+        return await this.handleRequirementsExtractionFailure(runDir, record, resume, model, source.paths, corrections, error instanceof Error ? error : new Error(String(error)));
+      }
       const digest = baselineDigest(baseline);
       const baselinePath = path.join(runDir, 'requirements-baseline.json');
       const markdownPath = path.join(runDir, 'requirements-baseline.md');
@@ -1765,12 +1920,19 @@ class WorkflowView implements vscode.WebviewViewProvider {
         }
       }
       for (const file of [baselinePath, markdownPath, ...(corrections.length ? [correctionsPath] : [])]) if (!record.files.includes(file)) record.files.push(file);
-      if (secondaryReview?.decision === 'REVISE' && secondaryAttempt < 2) {
-        const correction = secondaryReview.correctionPrompt || [secondaryReview.summary, ...secondaryReview.findings].join('\n');
-        record.stage = 'requirements_secondary_revision';
-        await fs.writeFile(path.join(runDir, 'run.json'), JSON.stringify(record, null, 2), 'utf8');
-        this.setStatus(`${secondaryApprovalRole(record.preset).model} requested a baseline correction. Regenerating and reviewing it automatically…`);
-        return await this.prepareRequirementsGuard(runDir, record, resume, correction, secondaryAttempt + 1);
+      if (secondaryReview?.decision === 'REVISE') {
+        if (secondaryAttempt < 2) {
+          const correction = secondaryReview.correctionPrompt || [secondaryReview.summary, ...secondaryReview.findings].join('\n');
+          record.stage = 'requirements_secondary_revision';
+          await fs.writeFile(path.join(runDir, 'run.json'), JSON.stringify(record, null, 2), 'utf8');
+          this.setStatus(`${secondaryApprovalRole(record.preset).model} requested a baseline correction. Regenerating and reviewing it automatically…`);
+          return await this.prepareRequirementsGuard(runDir, record, resume, correction, secondaryAttempt + 1);
+        }
+        const reason = `${secondaryApprovalRole(record.preset).model} still found source-traceable requirements defects after two automatic correction passes. The optional local baseline was abandoned instead of asking the owner to repair generated output.\n\n${secondaryReview.summary}\n${secondaryReview.findings.map(item => `- ${item}`).join('\n')}`;
+        await this.recordDeclinedRequirements(runDir, record, resume, reason);
+        this.pendingRequirements = undefined;
+        this.setStatus('The optional local baseline did not pass its bounded secondary audit. Continuing from the approved source…');
+        return true;
       }
       if (secondaryReview?.decision === 'APPROVE') {
         const approvedAt = new Date().toISOString();
@@ -1794,12 +1956,9 @@ class WorkflowView implements vscode.WebviewViewProvider {
       this.currentInteraction = {
         type: 'requirementsApproval',
         text: `Local requirements baseline ready for human review. Open requirements-baseline.md, confirm that it preserves the approved scope without importing later-phase work, then approve it or add another correction. Corrections are cumulative and cannot be removed by regeneration.\n\nModel: ${model}\nExtracted requirements: ${baseline.requirements.length}\nLocked corrections: ${baseline.lockedCorrections.length}\nPrior requirements automatically preserved: ${preservedRequirements}\nDigest: ${digest.slice(0, 12)}…${secondaryReview ? `\n\n${secondaryApprovalRole(record.preset).model} secondary review: ${secondaryReview.decision}\n${secondaryReview.summary}` : ''}`,
-        details: secondaryReview?.findings.length ? secondaryApprovalMarkdown('Secondary requirements approval review', secondaryApprovalRole(record.preset).model, secondaryReview) : undefined,
-        responseTemplate: secondaryReview?.decision === 'REVISE' ? secondaryReview.correctionPrompt : undefined
+        details: secondaryReview?.findings.length ? secondaryApprovalMarkdown('Secondary requirements approval review', secondaryApprovalRole(record.preset).model, secondaryReview) : undefined
       };
-      this.setStatus(secondaryReview?.decision === 'REVISE'
-        ? `${secondaryApprovalRole(record.preset).model} found requirements-baseline corrections. Review its findings before approval.`
-        : 'Requirements baseline awaiting human approval. Planning is paused.');
+      this.setStatus('Requirements baseline awaiting human approval. Planning is paused.');
       this.sendViewState();
       return false;
     } finally {
@@ -1811,9 +1970,121 @@ class WorkflowView implements vscode.WebviewViewProvider {
     }
   }
 
+  private showRequirementsFallback(runDir: string, record: RunRecord, resume: ResumeContext): void {
+    this.pendingRequirements = { runDir, record, resume };
+    this.pendingMore = undefined;
+    this.currentTask = record.task;
+    this.activePresetName = record.preset.name;
+    this.currentArtifacts = record.files.map(file => ({ path: file, name: path.basename(file) }));
+    const count = record.requirementsGuard?.failureRequirementCount;
+    const operation = record.requirementsGuard?.failureOperation === 'reconciliation' ? 'reconciliation' : 'extraction';
+    this.currentInteraction = {
+      type: 'requirementsFallback',
+      text: `The optional generated requirements ${operation}${count ? ` produced ${count} requirements` : ''} and could not be accepted safely. The complete failed evidence remains in this run. Continue from the authoritative task, selected specification, owner decisions, and parent context without using the generated baseline as an operative contract.`,
+      details: 'This does not remove or narrow product scope. The generated baseline will be marked declined, secondary plan approval and code review remain enabled, and this same workflow will continue into planning without rerunning extraction.'
+    };
+    this.setStatus('Optional requirements extraction could not be accepted. Choose “Continue from approved source without generated baseline”.');
+    this.sendViewState();
+  }
+
+  private async ensureRequirementsFailureEvidence(runDir: string, record: RunRecord, resume: ResumeContext, options?: {
+    model?: string;
+    sourcePaths?: string[];
+    corrections?: RequirementsCorrection[];
+    error?: Error;
+  }): Promise<void> {
+    const recordedAt = new Date().toISOString();
+    const existing = record.requirementsGuard;
+    const error = options?.error;
+    let recoveredCorrections = options?.corrections ?? existing?.corrections ?? [];
+    let correctionsPath = existing?.correctionsPath;
+    const candidateCorrectionsPath = correctionsPath ?? path.join(runDir, 'requirements-corrections.md');
+    try {
+      const correctionDocument = await fs.readFile(candidateCorrectionsPath, 'utf8');
+      if (!recoveredCorrections.length) recoveredCorrections = parseLockedCorrectionsMarkdown(correctionDocument);
+      correctionsPath = candidateCorrectionsPath;
+      if (!record.files.includes(candidateCorrectionsPath)) record.files.push(candidateCorrectionsPath);
+    } catch { /* Older failed runs may not have a corrections artifact. */ }
+    const attempt = String((existing?.candidateHistoryPaths?.length ?? 0) + 1).padStart(2, '0');
+    let failedCandidatePath = existing?.failedCandidatePath;
+    let baselinePath = existing?.baselinePath;
+    let baselineMarkdownPath = existing?.baselineMarkdownPath;
+    let digest = existing?.digest;
+    const candidateHistoryPaths = [...(existing?.candidateHistoryPaths ?? [])];
+    const capacityError = isRequirementsCapacityError(error) ? error : undefined;
+    if (capacityError?.candidate) {
+      const historyDir = path.join(runDir, 'requirements-history');
+      await fs.mkdir(historyDir, { recursive: true });
+      failedCandidatePath = path.join(historyDir, `over-limit-${capacityError.operation}-candidate-${attempt}.json`);
+      const failedMarkdownPath = path.join(historyDir, `over-limit-${capacityError.operation}-candidate-${attempt}.md`);
+      const candidateDigest = baselineDigest(capacityError.candidate);
+      await fs.writeFile(failedCandidatePath, JSON.stringify(capacityError.candidate, null, 2), 'utf8');
+      await fs.writeFile(failedMarkdownPath, baselineMarkdown(capacityError.candidate, candidateDigest)
+        .replace('Status: Awaiting human approval', `Status: Rejected generated candidate — ${capacityError.requirementCount} requirements exceed the supported optional-baseline limit`), 'utf8');
+      for (const file of [failedCandidatePath, failedMarkdownPath]) {
+        if (!candidateHistoryPaths.includes(file)) candidateHistoryPaths.push(file);
+        if (!record.files.includes(file)) record.files.push(file);
+      }
+      baselinePath ??= failedCandidatePath;
+      baselineMarkdownPath ??= failedMarkdownPath;
+      digest ??= candidateDigest;
+    }
+    const failureEvidencePath = existing?.failureEvidencePath ?? path.join(runDir, 'requirements-extraction-failure.md');
+    const message = error?.message ?? record.detail ?? 'The optional generated requirements baseline could not be accepted safely.';
+    await fs.writeFile(failureEvidencePath, `# Requirements extraction fallback\n\nRecorded: ${recordedAt}\n\n${message}\n\nNo requirement was truncated or approved. The generated candidate and prior baseline artifacts remain diagnostic evidence only. The authoritative task, selected specification, owner decisions, parent context, and implementation authorization remain unchanged.\n`, 'utf8');
+    if (!record.files.includes(failureEvidencePath)) record.files.push(failureEvidencePath);
+    const fallbackBaselinePath = baselinePath ?? path.join(runDir, 'requirements-baseline.json');
+    const fallbackMarkdownPath = baselineMarkdownPath ?? path.join(runDir, 'requirements-baseline.md');
+    record.requirementsGuard = {
+      model: options?.model ?? existing?.model ?? record.preset.ollamaModel,
+      status: 'draft',
+      baselinePath: fallbackBaselinePath,
+      baselineMarkdownPath: fallbackMarkdownPath,
+      digest: digest ?? '',
+      sourcePaths: options?.sourcePaths ?? existing?.sourcePaths ?? [],
+      corrections: recoveredCorrections,
+      correctionsPath,
+      candidateHistoryPaths,
+      autoPreservedRequirements: existing?.autoPreservedRequirements ?? 0,
+      preservationFailures: existing?.preservationFailures ?? 0,
+      architecturalReviews: existing?.architecturalReviews ?? 0,
+      finalCanonicalCorrectionUsed: existing?.finalCanonicalCorrectionUsed,
+      humanDirectedPasses: existing?.humanDirectedPasses,
+      failureKind: capacityError ? 'capacity' : existing?.failureKind ?? 'generation',
+      failureOperation: capacityError?.operation ?? existing?.failureOperation ?? (/reconciliation/i.test(message) ? 'reconciliation' : 'extraction'),
+      failureRequirementCount: capacityError?.requirementCount ?? existing?.failureRequirementCount ?? (Number(/(?:produced|returned|contains)\s+(\d+)\s+(?:unique\s+)?requirements/i.exec(message)?.[1] || 0) || undefined),
+      failureEvidencePath,
+      failedCandidatePath,
+    };
+    record.stage = 'requirements_fallback_available';
+    record.detail = message;
+    await fs.writeFile(path.join(runDir, 'run.json'), JSON.stringify(record, null, 2), 'utf8');
+  }
+
+  private async handleRequirementsExtractionFailure(
+    runDir: string,
+    record: RunRecord,
+    resume: ResumeContext,
+    model: string,
+    sourcePaths: string[],
+    corrections: RequirementsCorrection[],
+    error: Error,
+  ): Promise<boolean> {
+    await this.ensureRequirementsFailureEvidence(runDir, record, resume, { model, sourcePaths, corrections, error });
+    if (record.preset.secondarySolApproval) {
+      await this.recordDeclinedRequirements(runDir, record, resume, `The optional generated requirements baseline could not be accepted safely and was automatically declined under the enabled secondary-approval fallback policy. ${error.message}`);
+      this.pendingRequirements = undefined;
+      this.setStatus('The optional generated baseline exceeded its supported capacity. It was preserved and declined; continuing from the approved source…');
+      return true;
+    }
+    this.showRequirementsFallback(runDir, record, resume);
+    return false;
+  }
+
   private async approveRequirementsBaseline(): Promise<void> {
     if (!this.pendingRequirements) throw new Error('Open the requirements baseline checkpoint before approving it.');
     const pending = this.pendingRequirements;
+    if (pending.record.requirementsGuard?.failureKind) throw new Error('This generated baseline failed its safety checks and cannot be approved. Continue from the approved source without the generated baseline.');
     const baseline = await readRequirementsBaseline(pending.record);
     if (!baseline) throw new Error('The requirements baseline could not be read. Regenerate it before continuing.');
     const digest = baselineDigest(baseline);
@@ -1845,21 +2116,34 @@ class WorkflowView implements vscode.WebviewViewProvider {
     await this.start(pending.record.task, pending.record.preset, undefined, { ...resume, record: pending.record });
   }
 
+  private async recordDeclinedRequirements(runDir: string, record: RunRecord, resume: ResumeContext, reason: string): Promise<void> {
+    const declinedAt = new Date().toISOString();
+    const explanation = reason || 'The local extraction was not reliable enough to approve. Continue from the approved task, specification, and parent roadmap without treating this candidate as authoritative.';
+    const authoritativeSources = record.requirementsGuard?.sourcePaths ?? [];
+    const sourceDirections = authoritativeSources.length ? `\n\nAuthoritative source files to inspect directly:\n${authoritativeSources.map(item => `- ${item}`).join('\n')}` : '';
+    const lockedCorrections = record.requirementsGuard?.corrections ?? [];
+    const correctionDirections = lockedCorrections.length ? `\n\nSource-traceable locked corrections preserved from the failed extraction review:\n${lockedCorrections.map((item, index) => `- LOCK-${String(index + 1).padStart(3, '0')}: ${item.text}`).join('\n')}` : '';
+    const artifactPath = path.join(runDir, 'requirements-baseline-declined.md');
+    await fs.writeFile(artifactPath, `# Local requirements baseline declined\n\nDeclined: ${declinedAt}\n\n${explanation}\n\nThe generated baseline remains in the run history for diagnosis, but it is not an approved scope contract. The approved task, selected specification, parent roadmap, planning ledger, and human guidance remain authoritative.${sourceDirections}${correctionDirections}\n`, 'utf8');
+    if (!record.files.includes(artifactPath)) record.files.push(artifactPath);
+    try {
+      const baselineMarkdownPath = record.requirementsGuard?.baselineMarkdownPath;
+      if (baselineMarkdownPath) {
+        const markdown = await fs.readFile(baselineMarkdownPath, 'utf8');
+        await fs.writeFile(baselineMarkdownPath, markdown.replace(/^Status:.*$/m, `Status: Declined at ${declinedAt} — diagnostic artifact only`), 'utf8');
+      }
+    } catch { /* The dedicated decline artifact and run state remain authoritative. */ }
+    record.requirementsGuard = { ...record.requirementsGuard!, status: 'declined', approvedAt: undefined, declinedAt, declinedFallbackAt: declinedAt, declineReason: explanation };
+    record.preset = { ...record.preset, requirementsGuard: false };
+    record.humanInput = [record.humanInput, `Local requirements baseline declined at ${declinedAt}. Do not use it as a scope contract. Continue from the approved task, selected specification, parent roadmap, and planning ledger. Inspect the authoritative source files directly rather than relying on the rejected extraction. Reason: ${explanation}${sourceDirections}${correctionDirections}`].filter(Boolean).join('\n\n');
+    record.stage = resume.stage;
+    await fs.writeFile(path.join(runDir, 'run.json'), JSON.stringify(record, null, 2), 'utf8');
+  }
+
   private async declineRequirementsBaseline(reason: string): Promise<void> {
     if (!this.pendingRequirements) throw new Error('Open the requirements baseline checkpoint before declining it.');
     const pending = this.pendingRequirements;
-    const declinedAt = new Date().toISOString();
-    const explanation = reason || 'The local extraction was not reliable enough to approve. Continue from the approved task, specification, and parent roadmap without treating this candidate as authoritative.';
-    const authoritativeSources = pending.record.requirementsGuard?.sourcePaths ?? [];
-    const sourceDirections = authoritativeSources.length ? `\n\nAuthoritative source files to inspect directly:\n${authoritativeSources.map(item => `- ${item}`).join('\n')}` : '';
-    const artifactPath = path.join(pending.runDir, 'requirements-baseline-declined.md');
-    await fs.writeFile(artifactPath, `# Local requirements baseline declined\n\nDeclined: ${declinedAt}\n\n${explanation}\n\nThe generated baseline remains in the run history for diagnosis, but it is not an approved scope contract. The approved task, selected specification, parent roadmap, planning ledger, and human guidance remain authoritative.${sourceDirections}\n`, 'utf8');
-    if (!pending.record.files.includes(artifactPath)) pending.record.files.push(artifactPath);
-    pending.record.requirementsGuard = { ...pending.record.requirementsGuard!, status: 'declined', declinedAt, declineReason: explanation };
-    pending.record.preset = { ...pending.record.preset, requirementsGuard: false };
-    pending.record.humanInput = [pending.record.humanInput, `Local requirements baseline declined at ${declinedAt}. Do not use it as a scope contract. Continue from the approved task, selected specification, parent roadmap, and planning ledger. Inspect the authoritative source files directly rather than relying on the rejected extraction. Reason: ${explanation}${sourceDirections}`].filter(Boolean).join('\n\n');
-    pending.record.stage = pending.resume.stage;
-    await fs.writeFile(path.join(pending.runDir, 'run.json'), JSON.stringify(pending.record, null, 2), 'utf8');
+    await this.recordDeclinedRequirements(pending.runDir, pending.record, pending.resume, reason);
     this.pendingRequirements = undefined;
     await this.start(pending.record.task, pending.record.preset, undefined, { ...pending.resume, record: pending.record });
   }
@@ -1939,10 +2223,12 @@ class WorkflowView implements vscode.WebviewViewProvider {
     }
     if (type === 'runFinalVerification') { await this.runFinalVerification(humanInput); return; }
     if (type === 'completeAcceptance') { await this.completeAcceptance(humanInput); return; }
+    if (type === 'continueWithoutGeneratedBaseline') {
+      await this.declineRequirementsBaseline('The optional generated baseline was not accepted. Continue from the authoritative task, selected specification, owner decisions, and parent context without treating generated extraction as an operative contract.');
+      return;
+    }
     if (type === 'recheckPrerequisite') {
-      if (!this.pendingPrerequisite) throw new Error('There is no waiting prerequisite to recheck.');
-      const pending = this.pendingPrerequisite;
-      await this.start(pending.record.task, pending.record.preset, humanInput, { ...pending, stage: 'reviewing', review: undefined });
+      await this.recheckWaitingPrerequisite(humanInput);
       return;
     }
     if (type === 'startPrerequisiteWorkflow') { await this.startPrerequisiteWorkflow(); return; }
@@ -1962,13 +2248,64 @@ class WorkflowView implements vscode.WebviewViewProvider {
     void this.releaseMobileTunnelOwnership();
   }
 
+  private async recheckWaitingPrerequisite(humanInput: string): Promise<void> {
+    if (!this.pendingPrerequisite) throw new Error('Open the waiting phase again before rechecking its prerequisite.');
+    const pending = this.pendingPrerequisite;
+    const submission = humanInput.trim();
+    const prerequisiteText = `${pending.prerequisite.title}\n${pending.prerequisite.reason}\n${pending.prerequisite.resumeWhen}`;
+    const procedure = humanPrerequisiteProcedure(pending.plan ?? '', prerequisiteText);
+    if (procedure && !validatePrerequisiteResults(procedure, submission)) {
+      throw new Error('Complete the prerequisite results field before rechecking. Replace every placeholder with PASS, FAIL, or UNVERIFIED and the requested observation.');
+    }
+    const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const repositoryDigest = workspace ? await prerequisiteRepositoryDigest(workspace) : '';
+    if (!prerequisiteEvidenceChanged(pending.record.lastPrerequisiteSubmission, pending.record.lastPrerequisiteRepositoryDigest, submission, repositoryDigest)) {
+      this.showWaitingForPrerequisite(pending.runDir, pending.record, pending.plan ?? '', pending.review, pending.prerequisite!);
+      this.setStatus('Still waiting for the prerequisite. No submitted evidence or relevant repository state changed, so no review round was consumed.');
+      this.sendViewState();
+      return;
+    }
+    pending.record.lastPrerequisiteSubmission = submission;
+    pending.record.lastPrerequisiteRepositoryDigest = repositoryDigest;
+    await fs.writeFile(path.join(pending.runDir, 'run.json'), JSON.stringify(pending.record, null, 2), 'utf8');
+    await this.start(pending.record.task, pending.record.preset, submission, { ...pending, stage: 'reviewing', review: undefined });
+  }
+
   private async startPrerequisiteWorkflow(): Promise<void> {
     if (!this.pendingPrerequisite) throw new Error('Open the waiting phase again before starting its prerequisite.');
     const pending = this.pendingPrerequisite;
     const prerequisite = pending.prerequisite;
     const waitingPhase = pending.record.splitPhaseTitle || pending.record.workflowName || 'the saved phase';
-    const task = `Review the repository's current backlog and planning documents, then create a standalone implementation plan for ${prerequisite.title}. This work is an external prerequisite for the saved phase “${waitingPhase}”. Keep this workflow limited to ${prerequisite.title}; do not absorb or complete the waiting phase.\n\nWhy it is required:\n${prerequisite.reason}\n\nEvidence needed before returning to the waiting phase:\n${prerequisite.resumeWhen}`;
-    await this.start(task, pending.record.preset, 'This workflow was started from a saved phase that is waiting on this prerequisite.', undefined, undefined, undefined, undefined, undefined, undefined, undefined, path.join(pending.runDir, 'run.json'));
+    const runs = await readRunRecords(path.dirname(pending.runDir));
+    const existingOrdinals = [...runs.values()].flatMap(({ record }) => record.prerequisiteParentRunId === pending.record.id && Number.isInteger(record.prerequisiteOrdinal) ? [record.prerequisiteOrdinal!] : []);
+    const ordinal = Math.max(0, ...existingOrdinals) + 1;
+    const prerequisitePath = [...(pending.record.prerequisitePath ?? []), ordinal];
+    const purpose = prerequisite.workType ?? inferWorkflowPurpose(`${prerequisite.title}\n${prerequisite.reason}\n${prerequisite.resumeWhen}`);
+    const deliverable = purpose === 'implementation'
+      ? `create a standalone implementation plan for ${prerequisite.title}`
+      : purpose === 'planning-document-delivery'
+        ? `prepare and deliver only the explicitly authorized planning documents for ${prerequisite.title}`
+        : purpose === 'verification'
+          ? `verify and record the bounded evidence for ${prerequisite.title}`
+          : `record the bounded external evidence for ${prerequisite.title}`;
+    const task = `Review the repository's current state, then ${deliverable}. This work is a prerequisite for the saved phase “${waitingPhase}”. Keep this workflow limited to ${prerequisite.title}; do not absorb, implement, or complete the waiting phase.\n\nWhy it is required:\n${prerequisite.reason}\n\nEvidence needed before returning to the waiting phase:\n${prerequisite.resumeWhen}\n\nParent authorization and scope (preserve exactly; it does not authorize broader work):\n${pending.record.originalTask ?? pending.record.task}`;
+    const ownerDocumentPaths = pending.record.ownerDocumentPaths ?? (pending.record.workflowKind === 'prerequisite' || pending.record.parentRunId || pending.record.returnToRunFile ? [] : explicitlyWritablePaths(pending.record.originalTask ?? pending.record.task));
+    const pendingAfter = inferPendingAfterPrerequisite(pending.record, pending.plan);
+    await this.start(
+      task,
+      pending.record.preset,
+      'This workflow was started from a saved phase that is waiting on this prerequisite.',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      prerequisite.title,
+      pending.record.workflowName,
+      pending.record.phasePath,
+      path.join(pending.runDir, 'run.json'),
+      undefined,
+      { ownerDocumentPaths, workflowKind: 'prerequisite', workflowPurpose: purpose, prerequisiteParentRunId: pending.record.id, prerequisitePath, prerequisiteOrdinal: ordinal, pendingAfterPrerequisite: pendingAfter, resumeAfterPrerequisite: pending.record.resumeAfterPrerequisite ?? 'reviewing' }
+    );
   }
 
   private async returnToWaitingWorkflow(): Promise<void> {
@@ -1977,7 +2314,38 @@ class WorkflowView implements vscode.WebviewViewProvider {
     if (!target) throw new Error('This workflow does not have a saved parent link. Use “Resume saved run…” for workflows created by an older extension version.');
     try { await fs.access(target); }
     catch { throw new Error('The parent workflow’s run.json could not be found. Use “Resume saved run…” to locate it.'); }
-    await this.resumeRun(target);
+    if (!this.currentRunFile) throw new Error('The completed prerequisite run could not be identified. Open its saved run and try again.');
+    const childRunDir = path.dirname(this.currentRunFile);
+    const child = JSON.parse(await fs.readFile(this.currentRunFile, 'utf8')) as RunRecord;
+    if (!isCompletedPrerequisiteState(child)) throw new Error('This prerequisite has not reached verified completion, so its parent cannot be rechecked yet.');
+    const report = await persistPrerequisiteCompletionReport(childRunDir, child);
+    await fs.writeFile(this.currentRunFile, JSON.stringify(child, null, 2), 'utf8');
+    const parent = JSON.parse(await fs.readFile(target, 'utf8')) as RunRecord;
+    parent.files = Array.isArray(parent.files) ? parent.files : [];
+    const attached = attachPrerequisiteReport(parent.prerequisiteReports, report);
+    parent.prerequisiteReports = attached.reports;
+    parent.pendingAfterPrerequisite = inferPendingAfterPrerequisite(parent);
+    if (attached.added) {
+      const evidence = `Structured prerequisite completion report ${report.reportId}\nSource run: ${report.sourceRunId}\nPurpose: ${report.purpose}\nResult: ${report.summary}\nEvidence:\n${report.evidencePaths.map(file => `- ${file}`).join('\n') || '- recorded in the child run'}`;
+      parent.humanInput = [parent.humanInput, evidence].filter(Boolean).join('\n\n');
+    }
+    await fs.writeFile(target, JSON.stringify(parent, null, 2), 'utf8');
+    const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (workspace) await persistSplitPlanIndex(workspace, path.dirname(target), parent);
+    const parentRunDir = path.dirname(target);
+    const planPath = parent.workingDraftPath ?? parent.approvedPlanPath ?? path.join(parentRunDir, `round-${parent.round}-plan.md`);
+    let plan = '';
+    try { plan = await fs.readFile(planPath, 'utf8'); }
+    catch { throw new Error('The waiting parent’s saved plan could not be found for automatic recheck.'); }
+    this.returnToRunFile = parent.parentRunId ? path.join(path.dirname(parentRunDir), parent.parentRunId, 'run.json') : parent.returnToRunFile;
+    await this.start(parent.task, validatePreset(parent.preset), `Returned prerequisite report ${report.reportId}; assess this report against the saved resume condition, then continue the parent’s remaining work.`, {
+      runDir: parentRunDir,
+      record: parent,
+      stage: 'reviewing',
+      round: Math.max(1, parent.round || 1),
+      plan,
+      review: undefined,
+    });
   }
 
   private async completeAcceptance(results: string): Promise<void> {
@@ -2222,7 +2590,7 @@ Treat matching recorded PASS evidence as already satisfied. Do not prescribe or 
 ` : ''}
 
 Use the parent plan and repository as context, but keep this child plan limited to this phase. Do not re-plan the remaining parent scope. Inspect the current working tree before prescribing changes. If earlier overlapping work already satisfies some or all of this phase, produce a bounded verification plan for the remaining acceptance checks instead of repeating implementation.`;
-    await this.start(task, preset, phaseGuidance, undefined, undefined, parentRecord.id, index, phase.title, parentRecord.workflowName, [...(parentRecord.phasePath ?? []), index + 1], parentRecord.returnToRunFile);
+    await this.start(task, preset, phaseGuidance, undefined, undefined, parentRecord.id, index, phase.title, parentRecord.workflowName, [...(parentRecord.phasePath ?? []), index + 1], parentRecord.returnToRunFile, undefined, { workflowKind: 'split-phase', workflowPurpose: 'implementation' });
   }
   private rememberRun(runFile: string): void {
     this.currentRunFile = runFile;
@@ -2381,12 +2749,22 @@ Use the parent plan and repository as context, but keep this child plan limited 
     this.currentTask = record.task;
     this.activePresetName = record.preset.name;
     this.currentArtifacts = record.files.map(file => ({ path: file, name: path.basename(file) }));
+    const prerequisiteText = `${prerequisite.title}\n${prerequisite.reason}\n${prerequisite.resumeWhen}`;
+    const procedure = humanPrerequisiteProcedure(plan, prerequisiteText);
+    const responseTemplate = humanPrerequisiteResponseTemplate(procedure);
+    const humanProcedure = Boolean(procedure && responseTemplate);
     this.currentInteraction = {
       type: 'prerequisitePending',
       text: `Waiting for prerequisite: ${prerequisite.title}`,
-      details: `${prerequisite.reason}\n\nResume condition:\n${prerequisite.resumeWhen}\n\nThis phase remains saved and incomplete. Choose “Start prerequisite workflow” to begin the outside work. After it is complete, return to this saved run and choose “Recheck prerequisite”.`
+      details: humanProcedure
+        ? `${prerequisite.reason}\n\nWhat you need to do:\n${procedure}\n\nResume condition:\n${prerequisite.resumeWhen}\n\nComplete the results template below, then choose “Record results and recheck prerequisite”. PASS is not required: record FAIL or UNVERIFIED with the missing evidence, responsible role, and precise next action. Do not include secrets or account identifiers.`
+        : `${prerequisite.reason}\n\nResume condition:\n${prerequisite.resumeWhen}\n\nThis phase remains saved and incomplete. Choose “Start prerequisite workflow” to begin the outside work. After it is complete, return to this saved run and choose “Recheck prerequisite”.`,
+      responseTemplate,
+      humanProcedure,
     };
-    this.setStatus(`Waiting for prerequisite: ${prerequisite.title}. This phase is preserved and has not failed or completed.`);
+    this.setStatus(humanProcedure
+      ? `Human prerequisite session required: ${prerequisite.title}. Follow the checklist below and record each observation.`
+      : `Waiting for prerequisite: ${prerequisite.title}. This phase is preserved and has not failed or completed.`);
     this.sendViewState();
   }
 
@@ -2405,7 +2783,7 @@ Use the parent plan and repository as context, but keep this child plan limited 
     this.activePresetName = record.preset.name;
     this.currentArtifacts = record.files.map(file => ({ path: file, name: path.basename(file) }));
     this.currentInteraction = { type: 'prerequisiteComplete', text: record.detail || 'This prerequisite workflow is complete. Return to the saved waiting workflow and recheck its resume condition.' };
-    this.setStatus('Prerequisite workflow complete. Choose “Return to waiting workflow”.');
+    this.setStatus('Prerequisite workflow complete. Choose “Return and recheck parent” to carry its evidence back automatically.');
     this.sendViewState();
   }
 
@@ -2456,6 +2834,7 @@ Use the parent plan and repository as context, but keep this child plan limited 
       const completedSummary = record.codeDetail || 'Implementation, review, and any required human acceptance are complete.';
       record.detail = `Prerequisite workflow complete. Return to the saved waiting workflow and recheck its resume condition.\n\nLatest prerequisite result:\n${completedSummary}`;
       markPrerequisiteComplete(record);
+      await persistPrerequisiteCompletionReport(runDir, record);
       await fs.writeFile(path.join(runDir, 'run.json'), JSON.stringify(record, null, 2), 'utf8');
       this.showPrerequisiteComplete(runDir, record);
       return;
@@ -2597,6 +2976,28 @@ Use the parent plan and repository as context, but keep this child plan limited 
     raw.files = Array.isArray(raw.files) ? raw.files : [];
     const runDir = path.dirname(runFile);
     raw.returnToRunFile = raw.returnToRunFile ?? await inferReturnToWaitingRun(runDir, raw);
+    if (raw.returnToRunFile && !raw.prerequisiteParentRunId) {
+      try {
+        const parent = JSON.parse(await fs.readFile(raw.returnToRunFile, 'utf8')) as RunRecord;
+        raw.workflowKind = 'prerequisite';
+        raw.workflowPurpose = raw.workflowPurpose ?? inferWorkflowPurpose(`${raw.task}\n${raw.detail ?? ''}`);
+        raw.prerequisiteParentRunId = parent.id;
+        raw.workflowName = raw.workflowName ?? parent.workflowName;
+        raw.phasePath = raw.phasePath ?? parent.phasePath;
+        const records = await readRunRecords(path.dirname(runDir));
+        const linkedIds = [...records.values()]
+          .filter(({ record }) => record.id !== raw.id && (record.prerequisiteParentRunId === parent.id || record.returnToRunFile === raw.returnToRunFile))
+          .map(({ record }) => record.id)
+          .concat(raw.id)
+          .sort();
+        raw.prerequisiteOrdinal = raw.prerequisiteOrdinal ?? linkedIds.indexOf(raw.id) + 1;
+        raw.prerequisitePath = raw.prerequisitePath ?? [...(parent.prerequisitePath ?? []), raw.prerequisiteOrdinal];
+        raw.pendingAfterPrerequisite = raw.pendingAfterPrerequisite ?? inferPendingAfterPrerequisite(parent);
+        raw.resumeAfterPrerequisite = raw.resumeAfterPrerequisite ?? 'reviewing';
+      } catch { /* Preserve legacy return behavior when the linked parent is unavailable. */ }
+    }
+    raw.workflowKind = raw.workflowKind ?? (raw.parentRunId ? 'split-phase' : 'root');
+    raw.workflowPurpose = raw.workflowPurpose ?? 'implementation';
     this.returnToRunFile = raw.parentRunId ? path.join(path.dirname(runDir), raw.parentRunId, 'run.json') : raw.returnToRunFile;
     if (raw.acceptanceStatus === 'complete' && raw.acceptanceResultsPath) {
       try {
@@ -2628,7 +3029,11 @@ Use the parent plan and repository as context, but keep this child plan limited 
       await this.showCodeReady(runDir, raw);
       return;
     }
-    if (raw.requirementsGuard?.status === 'draft') {
+    const requirementsCapacityFallback = raw.requirementsGuard?.status === 'draft'
+      && (raw.stage === 'requirements_fallback_available' || hasRequirementsCapacityFailure(raw));
+    if (requirementsCapacityFallback) {
+      raw.stage = 'requirements_fallback_available';
+    } else if (raw.requirementsGuard?.status === 'draft') {
       raw.stage = 'waiting_for_requirements_approval';
     } else if (raw.decision === 'NEEDS_MORE_PLANNING') {
       clearSupersededCodeCheckpoint(raw);
@@ -2649,8 +3054,25 @@ Use the parent plan and repository as context, but keep this child plan limited 
     let plan = await readRound(round, 'plan');
     let review = await readRound(round, 'review');
     const folder = vscode.workspace.workspaceFolders?.[0];
+    if (raw.stage === 'requirements_fallback_available' && raw.requirementsGuard?.status === 'draft') {
+      const requirementsResume: ResumeContext = { runDir, record: raw, stage: 'planning', round: Math.max(1, round + (plan ? 1 : 0)), plan, review, orchestratorDirection: raw.orchestratorDirection };
+      await this.ensureRequirementsFailureEvidence(runDir, raw, requirementsResume);
+      if (raw.preset.secondarySolApproval) {
+        await this.recordDeclinedRequirements(runDir, raw, requirementsResume, 'The optional generated requirements baseline exceeded its supported capacity and was automatically declined under the enabled secondary-approval fallback policy. Continue from the authoritative source without generated requirements.');
+        await this.start(raw.task, raw.preset, undefined, { ...requirementsResume, record: raw });
+        return;
+      }
+      this.showRequirementsFallback(runDir, raw, requirementsResume);
+      return;
+    }
     if (raw.stage === 'waiting_for_requirements_approval' && raw.requirementsGuard?.status === 'draft') {
-      this.pendingRequirements = { runDir, record: raw, resume: { runDir, record: raw, stage: 'planning', round: Math.max(1, round + (plan ? 1 : 0)), plan, review, orchestratorDirection: raw.orchestratorDirection } };
+      const requirementsResume: ResumeContext = { runDir, record: raw, stage: 'planning', round: Math.max(1, round + (plan ? 1 : 0)), plan, review, orchestratorDirection: raw.orchestratorDirection };
+      if (raw.preset.secondarySolApproval) {
+        const approvedAutomatically = await this.prepareRequirementsGuard(runDir, raw, requirementsResume);
+        if (approvedAutomatically) await this.start(raw.task, raw.preset, undefined, { ...requirementsResume, record: raw });
+        return;
+      }
+      this.pendingRequirements = { runDir, record: raw, resume: requirementsResume };
       this.currentTask = raw.task;
       this.activePresetName = raw.preset.name;
       this.currentArtifacts = raw.files.map(file => ({ path: file, name: path.basename(file) }));
@@ -2729,7 +3151,7 @@ Use the parent plan and repository as context, but keep this child plan limited 
       this.activePresetName = preset.name;
       this.currentArtifacts = raw.files.map(file => ({ path: file, name: path.basename(file) }));
       this.currentInteraction = { type: 'needsInput', text: savedDecision.detail };
-      this.setStatus(`Waiting for your input at round ${round}/${preset.maxRounds}.`);
+      this.setStatus(planningProgress(round, preset.maxRounds, 'Waiting for your decision or guidance'));
       this.sendViewState();
       this.post({ type: 'needsInput', prompt: savedDecision.detail });
       return;
@@ -2818,7 +3240,7 @@ Use the parent plan and repository as context, but keep this child plan limited 
     await this.start(raw.task, preset, undefined, context);
   }
 
-  private async start(taskValue: unknown, preset: Preset, humanInputValue?: unknown, continuation?: ResumeContext, sourcePlanPathValue?: unknown, parentRunId?: string, splitPhaseIndex?: number, splitPhaseTitle?: string, workflowNameValue?: unknown, phasePath?: number[], returnToRunFileValue?: string, requirementsSourcePathValue?: unknown): Promise<void> {
+  private async start(taskValue: unknown, preset: Preset, humanInputValue?: unknown, continuation?: ResumeContext, sourcePlanPathValue?: unknown, parentRunId?: string, splitPhaseIndex?: number, splitPhaseTitle?: string, workflowNameValue?: unknown, phasePath?: number[], returnToRunFileValue?: string, requirementsSourcePathValue?: unknown, relationship?: StartRelationship): Promise<void> {
     if (this.running) throw new Error('A workflow is already running.');
     const task = String(taskValue ?? '').trim();
     const newHumanInput = String(humanInputValue ?? '').trim();
@@ -2872,7 +3294,7 @@ Use the parent plan and repository as context, but keep this child plan limited 
     this.controller = new AbortController();
     const cwd = folder.uri.fsPath;
     const runDir = continuation?.runDir ?? path.join(cwd, '.review-workflow', 'runs', randomUUID());
-    const record: RunRecord = continuation?.record ?? { id: path.basename(runDir), task, originalTask: task, workflowName: workflowName || undefined, phasePath, parentRunId, returnToRunFile: returnToRunFileValue, splitPhaseIndex, splitPhaseTitle, preset, stage: 'planning', round: 0, files: [] };
+    const record: RunRecord = continuation?.record ?? { ownerDocumentPaths: relationship ? (relationship.ownerDocumentPaths ?? []) : explicitlyWritablePaths(task), id: path.basename(runDir), task, originalTask: task, workflowName: workflowName || undefined, workflowKind: relationship?.workflowKind ?? (parentRunId ? 'split-phase' : 'root'), workflowPurpose: relationship?.workflowPurpose ?? 'implementation', phasePath, prerequisitePath: relationship?.prerequisitePath, prerequisiteParentRunId: relationship?.prerequisiteParentRunId, prerequisiteOrdinal: relationship?.prerequisiteOrdinal, pendingAfterPrerequisite: relationship?.pendingAfterPrerequisite, resumeAfterPrerequisite: relationship?.resumeAfterPrerequisite, parentRunId, returnToRunFile: returnToRunFileValue, splitPhaseIndex, splitPhaseTitle, preset, stage: 'planning', round: 0, files: [] };
     const recheckingPrerequisite = continuation?.record.stage === 'waiting_for_prerequisite';
     if (recheckingPrerequisite) clearSupersededCodeCheckpoint(record);
     record.humanInput = humanInput || record.humanInput;
@@ -2908,6 +3330,10 @@ Use the parent plan and repository as context, but keep this child plan limited 
     let latestReview = continuation?.review ?? '';
     try {
       await fs.mkdir(runDir, { recursive: true });
+      if (!continuation && !record.startingState) {
+        try { record.startingState = await captureWorktreeBaseline(cwd); }
+        catch { /* Non-Git workspaces retain the existing prompt-based preservation behavior. */ }
+      }
       const taskFile = await persistOriginalTask(runDir, record);
       if (taskFile && !this.currentArtifacts.some(artifact => artifact.path === taskFile)) {
         const name = path.basename(taskFile);
@@ -2950,9 +3376,11 @@ Use the parent plan and repository as context, but keep this child plan limited 
       const splitAllowed = canSplitPhase(task, record.phasePath);
       const roadmapPlanning = isArchitectureRoadmapTask(task, record.parentRunId);
       const humanAcceptanceGuard = 'When the requested outcome is a hands-on, visual, device, native-app, or interactive acceptance session, produce a concise operator checklist and results-recording plan. Reuse existing repository QA steps and ordinary evidence such as date, version, commit, fixture, observations, and PASS/FAIL results. Do not invent a harness, cryptographic attestation, evidence schema, trust anchor, semantic gate, or new automation unless the original human request or an existing repository requirement explicitly requires that machinery.';
-      const planningTargetGuard = roadmapPlanning
-        ? 'This root task requests architecture and a phased roadmap, not authorization to implement the whole system. Make the architecture, trust boundaries, invariants, dependencies, phase ownership, decision deadlines, and phase-level acceptance outcomes coherent. Do not expand every later phase into implementation-ready mechanics. Details needed only by a later phase belong in that phase or its decision deadline. The terminal outcome for a coherent roadmap is ROADMAP_READY, never READY_TO_CODE.'
-        : 'This task is being planned for implementation. Make only the current task or focused child phase implementation-ready; do not absorb sibling or later-phase work.';
+      const planningTargetGuard = record.workflowKind === 'prerequisite'
+        ? `This is a linked prerequisite, not an implementation phase. Its explicit purpose is ${record.workflowPurpose ?? 'implementation'}. Preserve its relationship to parent run ${record.prerequisiteParentRunId ?? 'recorded in returnToRunFile'} and do not count it as a split phase. Choose PREREQUISITE_COMPLETE when a verification, external-evidence, or bounded planning-document-delivery prerequisite is already delivered and its required evidence is verified. Choose READY_TO_CODE only when this prerequisite's purpose is implementation and code work genuinely remains. Never choose ROADMAP_READY or SPLIT merely to deliver or verify prerequisite evidence. For an owner-authorized planning-document delivery, choose DOCUMENTS_READY and return only the exact authorized documentDelivery paths and exact replacements; the extension, not an implementation agent, performs those bounded writes.`
+        : roadmapPlanning
+          ? 'This root task requests architecture and a phased roadmap, not authorization to implement the whole system. Make the architecture, trust boundaries, invariants, dependencies, phase ownership, decision deadlines, and phase-level acceptance outcomes coherent. Do not expand every later phase into implementation-ready mechanics. Details needed only by a later phase belong in that phase or its decision deadline. The terminal outcome for a coherent roadmap is ROADMAP_READY, never READY_TO_CODE.'
+          : 'This task is being planned for implementation. Make only the current task or focused child phase implementation-ready; do not absorb sibling or later-phase work.';
       const findingGuard = `For every material finding, identify a stable ID, source requirement or repository evidence, severity, affected phase, canonical plan location, closure condition, and status. A later-phase detail does not block the roadmap or an earlier phase unless the missing boundary would invalidate the architecture or current work. Revisions must replace the canonical rule and remove contradictory copies; review history stays in run artifacts, not in the plan. Separate correctness defects from wording preferences and optional improvements. Verify material provider claims against authoritative evidence or label them unverified; do not turn an unverified provider assumption into an invariant.${requirementsBaseline ? ' This run has a human-approved requirements baseline. Only a finding explicitly labeled BLOCKING and traced to a baseline ID or concrete repository evidence may cause revision. OPTIONAL findings are recorded but must not cause revision, and the orchestrator must not create new requirements.' : ''}`;
       const firstRound = continuation?.round ?? 1;
       let firstStage: ResumeStage = continuation?.stage ?? 'planning';
@@ -2972,7 +3400,7 @@ Use the parent plan and repository as context, but keep this child plan limited 
             try { localStarter = await fs.readFile(starterFile, 'utf8'); }
             catch (error) {
               if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-              this.setStatus(`Round ${round}/${preset.maxRounds}: Ollama is preparing a local planning starter`);
+              this.setStatus(planningProgress(round, preset.maxRounds, 'Ollama is preparing a local planning starter'));
               try {
                 localStarter = await createLocalWorkStarter(preset.ollamaModel, 'planning', [
                   `Current task:\n${task}`,
@@ -2994,7 +3422,7 @@ Use the parent plan and repository as context, but keep this child plan limited 
             : '';
           const fullPlannerContext = `${requirementsContract ? `\n\nRequirements preservation contract:\n${requirementsContract}` : ''}\n\nOriginal task:\n${task}\n\nPlanning ledger:\n${JSON.stringify(record.planningLedger, null, 2)}\n\nHuman guidance:\n${humanInput || 'None provided'}\n\nPrevious complete plan:\n${previousPlan}`;
           const resumedPlannerContext = `Continue the saved planning session. The original task, approved baseline, and prior canonical plan are unchanged. Return the complete revised canonical plan, not a patch or summary.`;
-          this.setStatus(useSourcePlan ? `Round ${round}/${preset.maxRounds}: loading existing plan` : `Round ${round}/${preset.maxRounds}: ${plannerSessionId ? 'continuing Claude planning session' : 'planning'}`);
+          this.setStatus(planningProgress(round, preset.maxRounds, useSourcePlan ? 'Loading the existing plan' : plannerSessionId ? 'Planner is continuing the saved planning session' : 'Planner is drafting or revising the plan'));
           plan = useSourcePlan ? sourcePlan! : await invoke(preset.planner,
             `Create or revise the complete planning artifact requested by the original task. Return the full canonical Markdown artifact, not a summary or a pointer to another file. Do not edit repository files. ${planningTargetGuard} Follow the orchestrator direction while retaining the review evidence needed to address it. Treat the planning ledger as the scope contract: preserve its locked decisions, resolve its open findings, keep deferred work out, and do not add unrelated requirements. ${findingGuard} Replace superseded text and every contradictory duplicate instead of appending revision history. Keep the artifact no larger than its requested planning purpose requires.${record.parentRunId ? ' This is a child phase. Limit the plan to the selected phase objective. Do not absorb, duplicate, complete, or replace sibling phases from any ancestor workflow.' : ''} ${humanAcceptanceGuard}${!splitAllowed ? manualAcceptancePhase ? ' This is a human acceptance phase and must remain one executable operator plan. Do not subdivide it or add prerequisite infrastructure to justify a subdivision.' : ' This phase is already at the nested-split safety limit. Produce one bounded executable plan; do not propose another subdivision or add prerequisite infrastructure to justify one.' : ''}${finalChildConvergence ? ' This is a final convergence pass. Apply only the saved reviewer and orchestrator corrections, remove superseded wording, and return the smallest executable plan. Do not introduce new requirements, optional improvements, evidence categories, or architecture.' : ''}\n\n${plannerSessionId ? resumedPlannerContext : fullPlannerContext}${localStarter ? `\n\nLocal Ollama planning starter (advisory; verify it and discard unsupported suggestions):\n${localStarter}` : ''}\n\nReviewer feedback:\n${feedback}\n\nOrchestrator direction for this revision:\n${orchestratorDirection || 'No additional direction; address the reviewer feedback without expanding scope.'}`,
             cwd, true, this.controller.signal, [], preset.claudeExploreModel, plannerSessionId, sessionId => {
@@ -3032,7 +3460,7 @@ Use the parent plan and repository as context, but keep this child plan limited 
         if (!review) {
           record.stage = 'reviewing';
           await writeRecord();
-          this.setStatus(`Round ${round}/${preset.maxRounds}: reviewing`);
+          this.setStatus(planningProgress(round, preset.maxRounds, 'Plan reviewer is checking scope, safety, and completeness'));
           review = await invoke(preset.reviewer,
             `Review this planning artifact against the repository, original request, and planning ledger. Do not edit files. The run's working-plan.md was refreshed from the supplied Plan immediately before this review. It may begin with an extension-owned HTML provenance comment; that comment is metadata, not revision history. Treat the supplied Plan body as authoritative and do not report working-plan.md as stale unless its body materially differs from the supplied Plan. ${planningTargetGuard} Give High, Medium, and Low findings with evidence, then a recommendation. ${findingGuard} For each finding, explicitly label it BLOCKING or OPTIONAL. A BLOCKING finding must trace to a requirements-baseline ID or concrete repository evidence and must state an observable closure condition. Suggestions, preferences, future hardening, and later-phase details are OPTIONAL and must not trigger another revision. Treat the original task and ledger as the scope boundary. Explicitly flag any lost locked decision, unresolved finding, deferred work pulled into scope, unnecessary expansion, contradictory duplicate, or revision-history accumulation.${record.parentRunId ? ' This is a child phase. Treat absorption, duplication, completion, or replacement of an ancestor workflow sibling as a High scope finding.' : ''} Do not invent improvements unrelated to the task, repository constraints, or recorded findings. On later rounds, identify newly discovered correctness defects separately from style preferences and optional improvements, and check whether each repair broke another confirmed requirement. For a narrow maintenance task, an executable plan that identifies the correct files, constraints, and verification commands is sufficient; do not require implementation results or command output during planning. ${humanAcceptanceGuard} For a human acceptance phase, the absence of newly invented automation or cryptographic proof is not a finding.${finalChildConvergence ? ' This is a final convergence review. Confirm whether the previously directed corrections are present. Raise a new blocking finding only when repository evidence shows that the procedure would be unsafe, impossible to execute, or unable to capture a required result. Treat wording preferences, optional hardening, additional evidence, and improvements beyond the original acceptance contract as non-blocking.' : ''}${requirementsBaseline ? `\n\nThe deterministic preservation check passed. Use this approved baseline for traceability; do not reinterpret or expand it:\n${JSON.stringify(requirementsBaseline, null, 2)}` : ''}\n\nOriginal task:\n${task}\n\nPlanning ledger:\n${JSON.stringify(record.planningLedger, null, 2)}\n\nHuman guidance:\n${humanInput || 'None provided'}\n\nPlan:\n${plan}`,
             cwd, true, this.controller.signal, [], preset.claudeExploreModel);
@@ -3045,14 +3473,21 @@ Use the parent plan and repository as context, but keep this child plan limited 
         latestReview = review;
         record.stage = 'deciding';
         await writeRecord();
-        this.setStatus(`Round ${round}/${preset.maxRounds}: deciding`);
+        this.setStatus(planningProgress(round, preset.maxRounds, 'Orchestrator is deciding the next step'));
         const rawDecision = await invoke(preset.orchestrator,
-          `Decide the next step for this planning artifact while acting as its scope keeper. Do not edit files. ${planningTargetGuard} Reply with ONLY JSON: {"decision":"REVISE|ROADMAP_READY|READY_TO_CODE|PHASE_COMPLETE|SPLIT|WAITING_FOR_PREREQUISITE|NEEDS_HUMAN|NEEDS_MORE_PLANNING|STOP","detail":"specific explanation or recommendation","workflowName":"short stable workflow name","plannerPrompt":"complete instructions for the planner's next revision","prerequisite":{"title":"outside work that must finish first","reason":"why this phase cannot execute yet","resumeWhen":"specific evidence or repository state that makes it resumable"},"planningLedger":{"objective":"stable objective","inScope":["bounded deliverable"],"lockedDecisions":["accepted decision that must not disappear"],"unresolvedFindings":["specific remaining blocker"],"deferred":["explicitly excluded work"],"findings":[{"id":"stable finding ID","summary":"specific finding","source":"requirement or repository evidence","severity":"High|Medium|Low","affectedPhase":"roadmap, current phase, or named later phase","canonicalLocation":"section where the rule belongs","closureCondition":"observable condition that resolves it","status":"open|resolved|deferred"}]},"phases":[{"title":"phase name","objective":"bounded objective","dependsOn":["earlier phase name"]}]}. ${record.parentRunId ? `This child belongs to workflow “${record.workflowName || 'the parent workflow'}”; return that exact workflowName unchanged.` : record.workflowName ? `Keep the existing workflowName exactly as “${record.workflowName}”.` : 'Create a concise, descriptive workflowName of two to six words from the root task. Avoid generic phrases such as implementation plan, workflow, task, or project. Keep that name unchanged in later rounds.'} Update the existing planning ledger conservatively. Preserve its objective, in-scope items, locked decisions, and deferred items unless repository evidence or explicit human guidance requires a change. ${findingGuard} The unresolvedFindings list must contain only blockers for the artifact currently being approved and must remove findings the new artifact demonstrably resolves. Put later-phase mechanics in the structured register as deferred to their owning phase unless they invalidate the architecture or current phase. Every new requirement must trace to the original task, a ledger item, repository evidence, or a reviewer finding; otherwise reject it as scope expansion. ${humanAcceptanceGuard}${record.parentRunId ? ' This is a child phase. Reject phases that absorb, duplicate, complete, or replace sibling phases from any ancestor workflow.' : ''}${splitAllowed ? ' A nested SPLIT is allowed only when this child contains independently implementable product deliverables. Repeated review findings, plan length, evidence formatting, or a desire for prerequisite infrastructure do not justify a split.' : manualAcceptancePhase ? ' SPLIT is forbidden because this is a human acceptance phase. Keep the operator session and its result recording together as one executable plan.' : ' SPLIT is forbidden because this phase is at the nested-split safety limit. Produce one simplified executable plan or close the phase when its existing implementation and acceptance are proven complete.'} ${roadmapPlanning ? 'Choose ROADMAP_READY once the architecture, boundaries, dependencies, phase outline, decision deadlines, and phase-level acceptance outcomes are coherent. Return the ordered phases with ROADMAP_READY. ROADMAP_READY explicitly does not authorize implementation; never use READY_TO_CODE for this root artifact. Do not block it on implementation mechanics that belong to a later phase.' : 'Use READY_TO_CODE only when the current focused plan still needs implementation.'} ${recheckingPrerequisite ? 'This is a prerequisite recheck. Choose PHASE_COMPLETE when repository and acceptance evidence prove the saved phase was already implemented and its resume condition is satisfied; do not send completed work back through planning or implementation. Choose WAITING_FOR_PREREQUISITE only when the recorded resume condition still is not met. PHASE_COMPLETE is forbidden outside a prerequisite recheck.' : 'PHASE_COMPLETE is forbidden because this is not a prerequisite recheck.'} Choose WAITING_FOR_PREREQUISITE when the plan itself is ready but explicitly cannot execute until work outside this root workflow or split hierarchy is completed. This state preserves the phase without failing, completing, implementing, or repeatedly replanning it. Name the outside work and give a concrete resume condition. Do not use it for an earlier phase inside the current split hierarchy; the extension already sequences those dependencies. Direct the planner to replace the canonical rule, remove contradictory copies, and keep review history out of the artifact. Judge convergence by closed findings and coherent dependencies, not word count or the phrase “one final revision.” A real new correctness or security defect remains blocking at its proper level even late in the run; narrow it explicitly instead of suppressing it to meet a round limit. Wording preferences and optional improvements do not justify another round. For narrow maintenance work, choose READY_TO_CODE as soon as the plan identifies the correct changes, constraints, and verification commands; do not require implementation-time evidence or keep revising wording. If the same material finding persists for two rounds, use one targeted correction or NEEDS_HUMAN for a genuine product decision; do not rewrite unrelated sections or manufacture another phase solely to house the finding. After six rounds, require targeted canonical corrections rather than another unrestricted rewrite. For REVISE or NEEDS_MORE_PLANNING, plannerPrompt must be a self-contained handoff that names each open finding ID, the canonical location to replace, contradictory copies to remove, what to preserve, and the exact closure condition. Use NEEDS_MORE_PLANNING on the final allowed round when bounded, actionable revisions remain. Use STOP only when further planning cannot productively continue and there is no actionable revision path; never use STOP to mean an already-complete phase. Use an empty plannerPrompt for other terminal decisions. Use an empty phases array unless the decision is SPLIT or ROADMAP_READY. For SPLIT or ROADMAP_READY, return ordered, independently actionable phases and preserve prerequisites in dependsOn. Round ${round} of ${preset.maxRounds}. On the final round, do not choose REVISE. If a human decision is required, choose NEEDS_HUMAN and put one clear question in detail.${finalChildConvergence ? ' This is a final convergence decision. If the directed corrections are present and no High issue makes the procedure unsafe, impossible, or unable to capture a required result, choose READY_TO_CODE. Do not extend planning for optional improvements, extra evidence, wording preferences, or speculative hardening.' : ''}\n\nOriginal task:\n${task}\n\nExisting workflow name:\n${record.workflowName || 'Not assigned yet'}\n\nExisting planning ledger:\n${JSON.stringify(record.planningLedger, null, 2)}\n\nHuman guidance:\n${humanInput || 'None provided'}\n\nComplete current plan:\n${plan}\n\nReview:\n${review}`,
+          `Decide the next step for this planning artifact while acting as its scope keeper. Do not edit files. ${planningTargetGuard} Reply with ONLY JSON: {"decision":"REVISE|ROADMAP_READY|READY_TO_CODE|DOCUMENTS_READY|PHASE_COMPLETE|PREREQUISITE_SATISFIED|SPLIT|WAITING_FOR_PREREQUISITE|PREREQUISITE_COMPLETE|NEEDS_HUMAN|NEEDS_MORE_PLANNING|STOP","detail":"specific explanation or recommendation","workflowName":"short stable workflow name","plannerPrompt":"complete instructions for the planner's next revision","resolvedPendingAfter":["exact pending owner-work item conclusively resolved by the current human reply"],"prerequisite":{"title":"outside work that must finish first","reason":"why this phase cannot execute yet","resumeWhen":"specific evidence or repository state that makes it resumable","workType":"implementation|planning-document-delivery|verification|external-evidence","pendingAfter":["parent work that remains after this prerequisite"]},"planningLedger":{"objective":"stable objective","inScope":["bounded deliverable"],"lockedDecisions":["accepted decision that must not disappear"],"unresolvedFindings":["specific remaining blocker"],"deferred":["explicitly excluded work"],"findings":[{"id":"stable finding ID","summary":"specific finding","source":"requirement or repository evidence","severity":"High|Medium|Low","affectedPhase":"roadmap, current phase, or named later phase","canonicalLocation":"section where the rule belongs","closureCondition":"observable condition that resolves it","status":"open|resolved|deferred"}]},"phases":[{"title":"phase name","objective":"bounded objective","dependsOn":["earlier phase name"]}],"documentDelivery":{"planDocument":{"path":"authorized workspace-relative markdown path","startHeading":"first heading to deliver"},"replacements":[{"path":"authorized existing markdown path","before":"exact text occurring once","after":"replacement text"}]}}. When pending owner work exists, copy an item into resolvedPendingAfter only when the current human reply conclusively resolves that exact item. A nonempty reply is not enough. Partial answers, “still pending,” “not approved,” and untouched templates resolve nothing. ${record.parentRunId ? `This child belongs to workflow “${record.workflowName || 'the parent workflow'}”; return that exact workflowName unchanged.` : record.workflowName ? `Keep the existing workflowName exactly as “${record.workflowName}”.` : 'Create a concise, descriptive workflowName of two to six words from the root task. Avoid generic phrases such as implementation plan, workflow, task, or project. Keep that name unchanged in later rounds.'} Update the existing planning ledger conservatively. Preserve its objective, in-scope items, locked decisions, and deferred items unless repository evidence or explicit human guidance requires a change. ${findingGuard} The unresolvedFindings list must contain only blockers for the artifact currently being approved and must remove findings the new artifact demonstrably resolves. Put later-phase mechanics in the structured register as deferred to their owning phase unless they invalidate the architecture or current phase. Every new requirement must trace to the original task, a ledger item, repository evidence, or a reviewer finding; otherwise reject it as scope expansion. ${humanAcceptanceGuard}${record.parentRunId ? ' This is a child phase. Reject phases that absorb, duplicate, complete, or replace sibling phases from any ancestor workflow.' : ''}${splitAllowed ? ' A nested SPLIT is allowed only when this child contains independently implementable product deliverables. Repeated review findings, plan length, evidence formatting, or a desire for prerequisite infrastructure do not justify a split.' : manualAcceptancePhase ? ' SPLIT is forbidden because this is a human acceptance phase. Keep the operator session and its result recording together as one executable plan.' : ' SPLIT is forbidden because this phase is at the nested-split safety limit. Produce one simplified executable plan or close the phase when its existing implementation and acceptance are proven complete.'} ${roadmapPlanning ? 'Choose ROADMAP_READY once the architecture, boundaries, dependencies, phase outline, decision deadlines, and phase-level acceptance outcomes are coherent. Return the ordered phases with ROADMAP_READY. ROADMAP_READY explicitly does not authorize implementation; never use READY_TO_CODE for this root artifact. Do not block it on implementation mechanics that belong to a later phase.' : 'Use READY_TO_CODE only when the current focused plan still needs implementation.'} ${recheckingPrerequisite ? 'This is a prerequisite recheck. Choose PREREQUISITE_SATISFIED when the recorded resume condition is met. That decision clears only the prerequisite gate and resumes the parent’s recorded remaining work; it never completes the parent by itself. Choose PHASE_COMPLETE only when the parent’s own deliverables, owner decisions, acceptance, and approval requirements are independently complete. Choose WAITING_FOR_PREREQUISITE only when the recorded resume condition is still unmet.' : 'PHASE_COMPLETE is allowed only when the current workflow’s own completion criteria are verified; prerequisite evidence alone is never sufficient.'} Choose WAITING_FOR_PREREQUISITE when the plan itself is ready but explicitly cannot execute until work outside this root workflow or split hierarchy is completed. This state preserves the phase without failing, completing, implementing, or repeatedly replanning it. Name the outside work and give a concrete resume condition. Do not use it for an earlier phase inside the current split hierarchy; the extension already sequences those dependencies. Direct the planner to replace the canonical rule, remove contradictory copies, and keep review history out of the artifact. Judge convergence by closed findings and coherent dependencies, not word count or the phrase “one final revision.” A real new correctness or security defect remains blocking at its proper level even late in the run; narrow it explicitly instead of suppressing it to meet a round limit. Wording preferences and optional improvements do not justify another round. For narrow maintenance work, choose READY_TO_CODE as soon as the plan identifies the correct changes, constraints, and verification commands; do not require implementation-time evidence or keep revising wording. If the same material finding persists for two rounds, use one targeted correction or NEEDS_HUMAN for a genuine product decision; do not rewrite unrelated sections or manufacture another phase solely to house the finding. After six rounds, require targeted canonical corrections rather than another unrestricted rewrite. For REVISE or NEEDS_MORE_PLANNING, plannerPrompt must be a self-contained handoff that names each open finding ID, the canonical location to replace, contradictory copies to remove, what to preserve, and the exact closure condition. Use NEEDS_MORE_PLANNING on the final allowed round when bounded, actionable revisions remain. Use STOP only when further planning cannot productively continue and there is no actionable revision path; never use STOP to mean an already-complete phase. Use an empty plannerPrompt for other terminal decisions. Use an empty phases array unless the decision is SPLIT or ROADMAP_READY. For SPLIT or ROADMAP_READY, return ordered, independently actionable phases and preserve prerequisites in dependsOn. Round ${round} of ${preset.maxRounds}. On the final round, do not choose REVISE. If a human decision is required, choose NEEDS_HUMAN and put one clear question in detail.${finalChildConvergence ? ' This is a final convergence decision. If the directed corrections are present and no High issue makes the procedure unsafe, impossible, or unable to capture a required result, choose READY_TO_CODE. Do not extend planning for optional improvements, extra evidence, wording preferences, or speculative hardening.' : ''}\n\nOriginal task:\n${task}\n\nExisting workflow name:\n${record.workflowName || 'Not assigned yet'}\n\nExisting planning ledger:\n${JSON.stringify(record.planningLedger, null, 2)}\n\nPending owner work:\n${JSON.stringify(record.pendingAfterPrerequisite ?? [])}\n\nCurrent human reply (the only reply eligible to resolve pending owner work):\n${newHumanInput || 'None provided'}\n\nRecorded human guidance:\n${humanInput || 'None provided'}\n\nComplete current plan:\n${plan}\n\nReview:\n${review}`,
           cwd, true, this.controller.signal, [], preset.claudeExploreModel);
         await save(`round-${round}-decision.json`, rawDecision);
         let result = parseDecision(rawDecision);
+        if (record.pendingAfterPrerequisite?.length) {
+          const ownerWork = resolvePendingOwnerWork(record.pendingAfterPrerequisite, newHumanInput, result.resolvedPendingAfter);
+          record.pendingAfterPrerequisite = ownerWork.remaining;
+          if (ownerWork.resolved.length) {
+            await save(`round-${round}-resolved-owner-work.json`, JSON.stringify({ resolved: ownerWork.resolved, remaining: ownerWork.remaining }, null, 2));
+          }
+        }
         if (recheckingPrerequisite && result.decision === 'STOP' && reportsCompletedPhaseRecheck(result.detail)) {
-          result = { ...result, decision: 'PHASE_COMPLETE', plannerPrompt: '', phases: [] };
+          result = { ...result, decision: 'PREREQUISITE_SATISFIED', plannerPrompt: '', phases: [] };
           await save(`round-${round}-decision.json`, JSON.stringify(result, null, 2));
         }
         let autoFinalCanonicalCorrection = false;
@@ -3079,7 +3514,18 @@ Use the parent plan and repository as context, but keep this child plan limited 
           }
           await save(`round-${round}-decision.json`, JSON.stringify(result, null, 2));
         }
-        const normalizedPrerequisiteDecision = normalizePrerequisitePlanningDecision(result.decision, Boolean(record.returnToRunFile));
+        if (record.workflowKind === 'prerequisite' && (result.decision === 'ROADMAP_READY' || result.decision === 'SPLIT')) {
+          const evidenceAlreadyComplete = record.workflowPurpose !== 'implementation'
+            && /\b(?:all|required|repository).{0,80}\b(?:checks?|evidence|delivery).{0,40}\b(?:pass|present|complete)|\bno further (?:plan revision|implementation|work) is needed/i.test(result.detail);
+          result = evidenceAlreadyComplete
+            ? { ...result, decision: 'PREREQUISITE_COMPLETE', detail: `Verified prerequisite delivery is complete; no roadmap or implementation phase is created.\n\n${result.detail}`, plannerPrompt: '', phases: [] }
+            : { ...result, decision: round < preset.maxRounds ? 'REVISE' : 'NEEDS_MORE_PLANNING', detail: `A bounded prerequisite cannot become a new roadmap or split hierarchy.\n\n${result.detail}`, plannerPrompt: `Converge this ${record.workflowPurpose ?? 'prerequisite'} workflow without creating another phase. If its evidence or delivery is already complete, verify it and choose PREREQUISITE_COMPLETE. If implementation genuinely remains, choose READY_TO_CODE.`, phases: [] };
+          await save(`round-${round}-decision.json`, JSON.stringify(result, null, 2));
+        }
+        const normalizedPrerequisiteDecision = normalizePrerequisitePlanningDecision(result.decision, {
+          hasWaitingWorkflow: Boolean(record.returnToRunFile),
+          purpose: record.workflowPurpose,
+        });
         if (normalizedPrerequisiteDecision !== result.decision) {
           result = {
             ...result,
@@ -3111,7 +3557,7 @@ Use the parent plan and repository as context, but keep this child plan limited 
           const repeatedIds = [...proposedOpenIds].filter(id => previousOpenIds.has(id));
           const newIds = [...proposedOpenIds].filter(id => !previousOpenIds.has(id));
           const resolvedIds = [...previousOpenIds].filter(id => !proposedOpenIds.has(id));
-          this.setStatus(`Round ${round}/${preset.maxRounds}: auditing planning convergence`);
+          this.setStatus(planningProgress(round, preset.maxRounds, 'Checkpoint auditor is checking whether planning has converged'));
           try {
             const rawAudit = await invoke(preset.orchestrator,
               `Audit whether this planning workflow should consume another revision round. Inspect the repository read-only when needed, but do not edit files and do not rewrite the plan. Reply with ONLY JSON: {"recommendation":"TARGETED_REVISION|READY|NEEDS_HUMAN|RETURN_TO_PARENT|STOP","summary":"short human-readable assessment of convergence","confirmedFindings":["finding ID and why it truly blocks"],"rejectedFindings":["finding ID and why it is resolved, optional, duplicated, unsupported, or out of scope"],"plannerPrompt":"one bounded self-contained correction handoff, or empty when no correction is recommended"}.
@@ -3171,7 +3617,7 @@ ${JSON.stringify(result, null, 2)}`,
         }
         if (preset.secondarySolApproval && preset.secondaryDecisionDelegation && result.decision === 'NEEDS_HUMAN' && !requiresDirectHumanAction(result.detail)) {
           const secondaryRole = secondaryApprovalRole(preset);
-          this.setStatus(`Round ${round}/${preset.maxRounds}: ${secondaryRole.model} is resolving the planning decision from approved evidence`);
+          this.setStatus(planningProgress(round, preset.maxRounds, `${secondaryRole.model} is resolving a delegated planning decision`));
           const rawDelegation = await invoke(secondaryRole, delegatedDecisionPrompt(
             result.detail,
             `Original task:\n${task}\n\nHuman guidance already recorded:\n${humanInput || 'None'}\n\nPlanning ledger:\n${JSON.stringify(record.planningLedger, null, 2)}\n\nCurrent plan:\n${plan}\n\nPlan review:\n${review}\n\nOrchestrator decision:\n${JSON.stringify(result, null, 2)}`
@@ -3198,7 +3644,7 @@ ${JSON.stringify(result, null, 2)}`,
         }
         if (preset.secondarySolApproval && result.decision === 'READY_TO_CODE') {
           const secondaryRole = secondaryApprovalRole(preset);
-          this.setStatus(`Round ${round}/${preset.maxRounds}: ${secondaryRole.model} is independently reviewing the completed plan`);
+          this.setStatus(planningProgress(round, preset.maxRounds, `${secondaryRole.model} is performing the final plan approval review`));
           const rawSecondaryReview = await invoke(secondaryRole,
             `Perform the final independent approval review of this implementation plan. Inspect the repository read-only when useful, but do not edit files. Reply with ONLY JSON: {"decision":"APPROVE|REVISE|NEEDS_HUMAN","summary":"concise assessment","findings":["specific blocking defect with requirement or repository evidence"],"correctionPrompt":"one bounded self-contained planner handoff, or empty when approved"}. Choose APPROVE only when the plan is safe, executable, correctly scoped, preserves accepted requirements, and has sufficient verification. Confirm the existing reviewer and orchestrator did not miss a High or actionable Medium defect. Reject optional hardening, stylistic preferences, speculative concerns, later-phase details, and requirements not grounded in the task, ledger, approved baseline, or repository. Choose NEEDS_HUMAN only for a genuine owner decision. An APPROVE decision authorizes this extension to begin implementation automatically.\n\nOriginal task:\n${task}\n\nPlanning ledger:\n${JSON.stringify(record.planningLedger, null, 2)}\n\nCompleted plan:\n${plan}\n\nExisting plan review:\n${review}\n\nExisting orchestrator decision:\n${JSON.stringify(result, null, 2)}`,
             cwd, true, this.controller.signal);
@@ -3246,6 +3692,72 @@ ${JSON.stringify(result, null, 2)}`,
           }
           await save(`round-${round}-decision.json`, JSON.stringify(result, null, 2));
         }
+        if (result.decision === 'DOCUMENTS_READY') {
+          const deliveryAuthorized = record.workflowPurpose === 'planning-document-delivery';
+          if (!deliveryAuthorized || !result.documentDelivery) throw new Error('Bounded document delivery requires a planning-document-delivery workflow and an explicit write authorization for every destination.');
+          const delivered = await applyBoundedDocumentDelivery(cwd, (record.ownerDocumentPaths ?? (record.workflowKind === 'prerequisite' ? [] : explicitlyWritablePaths(record.originalTask ?? record.task))).map(destination => `Write ${destination}.`).join('\n'), plan, result.documentDelivery);
+          const deliveryEvidence = path.join(runDir, `round-${round}-document-delivery.json`);
+          await fs.writeFile(deliveryEvidence, JSON.stringify(delivered, null, 2), 'utf8');
+          if (!record.files.includes(deliveryEvidence)) record.files.push(deliveryEvidence);
+          record.codeDetail = `Bounded planning-document delivery completed for: ${delivered.changedPaths.join(', ')}. The human-owned Git index and unrelated pre-existing changes were preserved.`;
+          if (record.returnToRunFile) {
+            result = { ...result, decision: 'PREREQUISITE_COMPLETE', detail: record.codeDetail, plannerPrompt: '', phases: [] };
+          } else {
+            const pending = inferPendingAfterPrerequisite(record, plan);
+            result = pending.length
+              ? { ...result, decision: 'NEEDS_HUMAN', detail: `Planning-document delivery is complete. Remaining owner work:\n- ${pending.join('\n- ')}`, plannerPrompt: '', phases: [] }
+              : { ...result, decision: 'PHASE_COMPLETE', detail: record.codeDetail, plannerPrompt: '', phases: [] };
+          }
+          await save(`round-${round}-decision.json`, JSON.stringify(result, null, 2));
+        }
+        if (recheckingPrerequisite && result.decision === 'PREREQUISITE_SATISFIED') {
+          const pending = inferPendingAfterPrerequisite(record, plan);
+          record.prerequisite = undefined;
+          record.lastPrerequisiteSubmission = undefined;
+          record.lastPrerequisiteRepositoryDigest = undefined;
+          if (parentOutcomeAfterPrerequisite(pending) === 'needs-owner-input') {
+            result = {
+              ...result,
+              decision: 'NEEDS_HUMAN',
+              detail: `The prerequisite is satisfied. The parent workflow is not complete and now needs the following owner action:\n- ${pending.join('\n- ')}`,
+              plannerPrompt: '',
+              phases: [],
+            };
+          } else {
+            if (round >= preset.maxRounds) {
+              preset.maxRounds = Math.min(50, preset.maxRounds + 1);
+              record.preset = preset;
+            }
+            result = {
+              ...result,
+              decision: 'REVISE',
+              detail: 'The prerequisite gate is satisfied. Resume the parent workflow’s remaining work without repeating the prerequisite.',
+              plannerPrompt: 'Continue only the parent workflow work that remained after the prerequisite. Reuse the attached structured completion report, remove the satisfied gate, preserve all approval boundaries, and do not claim the parent complete unless its own completion criteria are met.',
+              phases: [],
+            };
+          }
+          await save(`round-${round}-decision.json`, JSON.stringify(result, null, 2));
+        }
+        if (result.decision === 'READY_TO_CODE' && hasPendingOwnerApproval(record)) {
+          result = { ...result, decision: 'NEEDS_HUMAN', detail: `Explicit owner approval remains pending:\n- ${(record.pendingAfterPrerequisite ?? []).join('\n- ')}`, plannerPrompt: '', phases: [] };
+        }
+        if (result.decision === 'PHASE_COMPLETE') {
+          const pending = inferPendingAfterPrerequisite(record, plan);
+          if (pending.length) {
+            result = {
+              ...result,
+              decision: 'NEEDS_HUMAN',
+              detail: `The current deliverable may be complete, but the workflow still has owner-controlled work:\n- ${pending.join('\n- ')}`,
+              plannerPrompt: '',
+              phases: [],
+            };
+            await save(`round-${round}-decision.json`, JSON.stringify(result, null, 2));
+          }
+        }
+        if (result.decision === 'WAITING_FOR_PREREQUISITE') {
+          record.pendingAfterPrerequisite = inferPendingAfterPrerequisite({ ...record, prerequisite: result.prerequisite }, plan);
+          record.resumeAfterPrerequisite = record.resumeAfterPrerequisite ?? 'reviewing';
+        }
         if (!record.workflowName && result.workflowName) {
           record.workflowName = result.workflowName;
           this.currentWorkflowName = result.workflowName;
@@ -3255,7 +3767,7 @@ ${JSON.stringify(result, null, 2)}`,
         record.detail = result.detail;
         record.orchestratorDirection = result.plannerPrompt || undefined;
         record.splitPhases = result.decision === 'SPLIT' || result.decision === 'ROADMAP_READY' ? result.phases : undefined;
-        record.prerequisite = result.decision === 'WAITING_FOR_PREREQUISITE' ? result.prerequisite : undefined;
+        record.prerequisite = result.decision === 'WAITING_FOR_PREREQUISITE' ? result.prerequisite : record.prerequisite;
         await save(`round-${round}-ledger.json`, JSON.stringify(record.planningLedger, null, 2));
         await writeRecord();
         if (result.decision === 'NEEDS_HUMAN') {
@@ -3265,7 +3777,7 @@ ${JSON.stringify(result, null, 2)}`,
           this.pending = { runDir, record, stage: 'deciding', round, plan, review, question: result.detail };
           this.paused = true;
           this.currentInteraction = { type: 'needsInput', text: result.detail };
-          this.setStatus(`Waiting for your input at round ${round}/${preset.maxRounds}.`);
+          this.setStatus(planningProgress(round, preset.maxRounds, 'Waiting for a decision that could not be safely delegated'));
           this.post({ type: 'needsInput', prompt: result.detail });
           this.post({ type: 'paused', paused: true });
         }
@@ -3310,10 +3822,11 @@ ${JSON.stringify(result, null, 2)}`,
       }
       if (record.decision === 'PREREQUISITE_COMPLETE' && record.returnToRunFile) {
         markPrerequisiteComplete(record);
+        await persistPrerequisiteCompletionReport(runDir, record);
         await publishDraft(latestPlan, 'prerequisite workflow complete');
         await writeRecord();
         this.showPrerequisiteComplete(runDir, record);
-        showTemporaryWorkflowNotification('Prerequisite complete. Return to the saved waiting workflow.');
+        showTemporaryWorkflowNotification('Prerequisite complete. Choose “Return and recheck parent” to attach its evidence and continue the parent workflow.');
         return;
       }
       if (record.decision === 'PHASE_COMPLETE') {
@@ -3379,7 +3892,7 @@ ${JSON.stringify(result, null, 2)}`,
         this.paused = true;
         this.canReopenApprovedRequirements = record.requirementsGuard?.status === 'approved';
         this.currentInteraction = undefined;
-        this.setStatus(`${this.pauseRequested ? 'Paused' : 'Stopped'} at round ${record.round}/${preset.maxRounds} during ${record.resumeStage}. You can resume this run.`);
+        this.setStatus(planningProgress(record.round, preset.maxRounds, `${this.pauseRequested ? 'Paused' : 'Stopped'} during ${record.resumeStage}; this run can be resumed`));
         this.post({ type: 'paused', paused: true });
         this.sendViewState();
       } else {
@@ -3456,7 +3969,7 @@ ${JSON.stringify(result, null, 2)}`,
       this.currentArtifacts = record.files.map(file => ({ path: file, name: path.basename(file) }));
       if (!this.currentArtifacts.some(artifact => artifact.path === actionFile)) this.currentArtifacts.push({ path: actionFile, name: path.basename(actionFile) });
       this.currentInteraction = { type: 'codeNeedsInput', text: recoveredHandoff.question, details: humanPrompt, responseTemplate: recoveredHandoff.responseTemplate };
-      this.setStatus(`Interactive acceptance requires your input at code round ${round}/${record.preset.maxCodeRounds}. Starting the app alone does not complete the check.`);
+      this.setStatus(implementationProgress(round, record.preset.maxCodeRounds, 'Human acceptance is required; follow the complete checklist and record the requested observations'));
       this.sendViewState();
       return;
     }
@@ -3501,7 +4014,7 @@ ${JSON.stringify(result, null, 2)}`,
       }
       if (!this.currentArtifacts.some(artifact => artifact.path === actionFile)) this.currentArtifacts.push({ path: actionFile, name: path.basename(actionFile) });
       this.currentInteraction = { type: 'codeNeedsInput', text: pendingHumanDecision.question || 'Human input is required to continue.', details: humanPrompt, responseTemplate: pendingHumanDecision.responseTemplate };
-      this.setStatus(`Code review is waiting for your input at round ${round}/${record.preset.maxCodeRounds}.`);
+      this.setStatus(implementationProgress(round, record.preset.maxCodeRounds, 'Waiting for your decision or verification evidence'));
       this.sendViewState();
       return;
     }
@@ -3533,6 +4046,7 @@ ${JSON.stringify(result, null, 2)}`,
   }
 
   private async startCode(runDir: string, record: RunRecord, plan: string, continuation?: CodeContext): Promise<void> {
+    if (hasPendingOwnerApproval(record)) throw new Error('Explicit owner approval remains pending. Resolve it before implementation.');
     if (this.running) throw new Error('A workflow is already running.');
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) throw new Error('Open the project folder in VS Code first.');
@@ -3597,7 +4111,7 @@ ${JSON.stringify(result, null, 2)}`,
             try { localImplementationStarter = await fs.readFile(starterFile, 'utf8'); }
             catch (error) {
               if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-              this.setStatus(`Code round ${round}/${preset.maxCodeRounds}: Ollama is preparing an implementation work packet`);
+              this.setStatus(implementationProgress(round, preset.maxCodeRounds, 'Ollama is preparing an implementation work packet'));
               try {
                 localImplementationStarter = await createLocalWorkStarter(preset.ollamaModel, 'implementation', [
                   `Original task:\n${record.originalTask ?? record.task}`,
@@ -3616,7 +4130,7 @@ ${JSON.stringify(result, null, 2)}`,
           const implementerSessionId = preset.implementer.provider === 'claude'
             ? reusableClaudeSession(preset.claudeSessionPolicy, record.claudeSessions?.implementer, record.claudeSessions?.implementerStartedRound, round)
             : '';
-          this.setStatus(`Code round ${round}/${preset.maxCodeRounds}: ${implementerSessionId ? 'continuing Claude implementation session' : 'implementing the approved plan'}`);
+          this.setStatus(implementationProgress(round, preset.maxCodeRounds, implementerSessionId ? 'Implementer is continuing the saved coding session' : 'Implementer is applying the approved plan'));
           const firstImplementationContext = `Original task:\n${record.originalTask ?? record.task}\n\nApproved plan:\n${plan}\n\nPlanning ledger:\n${JSON.stringify(record.planningLedger, null, 2)}\n\nHuman guidance:\n${record.humanInput || 'None provided'}`;
           const resumedImplementationContext = `Continue the saved implementation session. The approved plan, scope boundaries, and existing user changes are unchanged. Inspect the current working tree and complete only the remaining work. Treat the newly recorded human guidance and verification evidence below as authoritative for unchanged checks; do not rerun a command solely to reconfirm evidence already marked PASS.\n\nNewly recorded human guidance and verification evidence:\n${record.humanInput || 'None provided'}`;
           implementation = await invoke(preset.implementer,
@@ -3655,7 +4169,7 @@ ${JSON.stringify(result, null, 2)}`,
               implementation += `\n\nInherited completed-sibling acceptance evidence:\n${siblingEvidence}`;
               record.humanInput = [record.humanInput, `Automatically inherited completed-sibling acceptance evidence:\n${siblingEvidence}`].filter(Boolean).join('\n\n');
               await save(`code-round-${round}-implementation.md`, implementation);
-              this.setStatus(`Code round ${round}/${preset.maxCodeRounds}: reused matching acceptance evidence from a completed sibling phase`);
+              this.setStatus(implementationProgress(round, preset.maxCodeRounds, 'Reusing matching acceptance evidence from a completed sibling phase'));
             } else if (handoff) {
               const humanPrompt = await buildCodeHumanPrompt(runDir, handoff);
               record.stage = 'waiting_for_code_human';
@@ -3667,7 +4181,7 @@ ${JSON.stringify(result, null, 2)}`,
               this.pendingCode = { runDir, record, stage: 'code_reviewing', round, plan, implementation, review, direction, question: handoff.question };
               this.paused = true;
               this.currentInteraction = { type: 'codeNeedsInput', text: handoff.question, details: humanPrompt, responseTemplate: handoff.responseTemplate };
-              this.setStatus(`Interactive verification requires your input at code round ${round}/${preset.maxCodeRounds}. Follow the complete saved procedure.`);
+              this.setStatus(implementationProgress(round, preset.maxCodeRounds, 'Interactive verification requires your input; follow the complete saved procedure'));
               this.sendViewState();
               return;
             } else {
@@ -3682,7 +4196,7 @@ ${JSON.stringify(result, null, 2)}`,
         if (stage === 'implementing' || stage === 'code_reviewing') {
           record.stage = record.codeStage = 'code_reviewing';
           await writeRecord();
-          this.setStatus(`Code round ${round}/${preset.maxCodeRounds}: reviewing the working tree`);
+          this.setStatus(implementationProgress(round, preset.maxCodeRounds, 'Code reviewer is inspecting the working tree and verification results'));
           review = await invoke(preset.codeReviewer,
             `Review the current working tree against the approved plan. Inspect the repository and git diff. Do not edit files. Report High, Medium, and Low findings with file evidence, the implementer's reported local check results, and any deviation from the approved scope. End with a clear recommendation. Ignore unrelated pre-existing changes except where they create a concrete conflict. Your environment is intentionally read only: do not treat your inability to run a command that writes files as a product finding. Identify missing local verification from the implementation summary and send it back as required work for the implementer. Never require a commit, push, pull request, deployment, remote CI run, or hosted artifact for CODE_READY; list those as optional human follow-up steps.\n\nOriginal task:\n${record.originalTask ?? record.task}\n\nApproved plan:\n${plan}\n\nImplementation summary:\n${implementation || 'No implementation summary was available; inspect the working tree directly.'}`,
             folder.uri.fsPath, true, this.controller.signal, [], preset.claudeExploreModel);
@@ -3690,7 +4204,7 @@ ${JSON.stringify(result, null, 2)}`,
         }
         record.stage = record.codeStage = 'code_deciding';
         await writeRecord();
-        this.setStatus(`Code round ${round}/${preset.maxCodeRounds}: deciding whether fixes are needed`);
+        this.setStatus(implementationProgress(round, preset.maxCodeRounds, 'Orchestrator is deciding whether fixes or verification remain'));
         const rawDecision = await invoke(preset.orchestrator,
           `Decide the next step after implementation and code review. Do not edit files. Reply with ONLY JSON: {"decision":"FIX|CODE_READY|NEEDS_HUMAN|NEEDS_MORE_CODE|STOP","detail":"specific explanation","implementerPrompt":"complete bounded instructions for the next fix pass","question":"one explicit question when human input is truly required, otherwise empty","humanInstructions":"complete numbered operator or acceptance procedure when human action is required, otherwise empty","expectedEvidence":["specific observation to report"],"responseTemplate":"ready-to-edit response containing every requested result, otherwise empty","humanAcceptanceRequired":false}. Choose CODE_READY when the approved code changes are implemented, no High findings remain, no actionable Medium code findings remain, and required local checks passed. Set humanAcceptanceRequired to true when CODE_READY still has manual, operator, device, visual, packaged-app, or other human-only acceptance checks that must be completed before the phase itself can be declared complete. In that case, fill humanInstructions, expectedEvidence, and responseTemplate completely; CODE_READY means automated work is complete while phase completion remains pending. Set it to false only when no required human acceptance remains. Choose FIX for bounded corrections and make implementerPrompt self-contained. Choose NEEDS_MORE_CODE on the final configured round when bounded, actionable corrections or missing local verification remain. Choose NEEDS_HUMAN only for a product decision, unavailable credential, destructive or irreversible action, unavailable external service, an interactive desktop action unavailable to the provider, or an explicit COMMAND_BLOCKED report from the implementer. Never send a blocked command through another automatic round: ask once with the exact command and expected evidence. Routine local edits, tests, Docker use, verification, and inspection must proceed without human input. When human action is required, inspect the approved plan and saved implementation/review evidence to recover the complete original procedure. The question must say plainly what outcome is needed. humanInstructions must include prerequisites, exact commands with the correct working directory and variable setup, ordered UI actions, expected result after each step, failure/stop conditions, and cleanup. Do not tell the human merely to 'run the check' or refer them to an unnamed plan section. expectedEvidence must enumerate every observation the workflow needs. responseTemplate must be ready to paste after replacing PASS/FAIL or requested values and must name any results file that should be updated. For a product choice, use humanInstructions to explain the options and consequences instead. Choose STOP only when implementation cannot productively or safely continue and there is no actionable fix path. A read-only reviewer sandbox is not itself a blocker: require the implementer to run and report local checks. Never require a commit, push, pull request, deployment, remote CI run, or hosted artifact for CODE_READY; those are explicitly outside this workflow and may be listed only as human follow-up. This is code round ${round} of ${preset.maxCodeRounds}.${round === preset.maxCodeRounds ? ' This is the final configured round; choose NEEDS_MORE_CODE instead of FIX when another bounded pass can resolve the findings.' : ''}\n\nOriginal task:\n${record.originalTask ?? record.task}\n\nApproved plan:\n${plan}\n\nHuman guidance:\n${record.humanInput || 'None provided'}\n\nImplementation summary:\n${implementation}\n\nCode review:\n${review}`,
           folder.uri.fsPath, true, this.controller.signal, [], preset.claudeExploreModel);
@@ -3698,7 +4212,7 @@ ${JSON.stringify(result, null, 2)}`,
         let result = parseCodeDecision(rawDecision);
         if (preset.secondarySolApproval && preset.secondaryDecisionDelegation && result.decision === 'NEEDS_HUMAN' && !requiresDirectHumanAction(`${result.question}\n${result.detail}\n${result.humanInstructions}`)) {
           const secondaryRole = secondaryApprovalRole(preset);
-          this.setStatus(`Code round ${round}/${preset.maxCodeRounds}: ${secondaryRole.model} is resolving the implementation decision from approved evidence`);
+          this.setStatus(implementationProgress(round, preset.maxCodeRounds, `${secondaryRole.model} is resolving a delegated implementation decision`));
           const rawDelegation = await invoke(secondaryRole, delegatedDecisionPrompt(
             `${result.question || result.detail}\n\n${result.humanInstructions}`,
             `Original task:\n${record.originalTask ?? record.task}\n\nRecorded human guidance:\n${record.humanInput || 'None'}\n\nApproved plan:\n${plan}\n\nImplementation summary:\n${implementation}\n\nCode review:\n${review}\n\nCode orchestrator decision:\n${JSON.stringify(result, null, 2)}`
@@ -3727,7 +4241,7 @@ ${JSON.stringify(result, null, 2)}`,
           record.secondaryCodeApprovalStatus = 'pending';
           record.secondaryCodeApprovalRound = round;
           await writeRecord();
-          this.setStatus(`Code round ${round}/${preset.maxCodeRounds}: ${secondaryRole.model} is independently reviewing the completed implementation`);
+          this.setStatus(implementationProgress(round, preset.maxCodeRounds, `${secondaryRole.model} is performing the final implementation approval review`));
           const rawSecondaryReview = await invoke(secondaryRole,
             `Perform a final independent review of the completed implementation against the approved plan and current working tree. Inspect the repository and staged and unstaged diffs read-only. Do not edit files. Reply with ONLY JSON: {"decision":"APPROVE|REVISE|NEEDS_HUMAN","summary":"concise assessment","findings":["specific High or actionable Medium defect with file evidence"],"correctionPrompt":"bounded implementer instructions, or empty when approved"}. Choose APPROVE only when the implementation satisfies the approved plan, contains no High or actionable Medium defect, preserves scope and the Git index, and the required automated checks have credible passing evidence. Do not require commits, pushes, deployment, remote CI, or optional hardening. Preserve genuine human-only acceptance as a later handoff rather than treating it as a code defect. Choose NEEDS_HUMAN only for a genuine product decision, unavailable credential, destructive action, unavailable external service, or required interactive acceptance.\n\nOriginal task:\n${record.originalTask ?? record.task}\n\nApproved plan:\n${plan}\n\nImplementation summary:\n${implementation}\n\nPrimary code review:\n${review}\n\nPrimary orchestrator decision:\n${JSON.stringify(result, null, 2)}`,
             folder.uri.fsPath, true, this.controller.signal);
@@ -3826,7 +4340,7 @@ ${JSON.stringify(result, null, 2)}`,
           }
           await save(`code-round-${round}-human-action.md`, `# Human action required\n\n${humanPrompt}\n`);
           this.currentInteraction = { type: 'codeNeedsInput', text: result.question || 'Human input is required to continue.', details: humanPrompt, responseTemplate: result.responseTemplate };
-          this.setStatus(`Code review is waiting for your input at round ${round}/${preset.maxCodeRounds}.`);
+          this.setStatus(implementationProgress(round, preset.maxCodeRounds, 'Waiting for a decision or action that could not be safely delegated'));
           this.sendViewState();
           return;
         }
@@ -3867,7 +4381,7 @@ ${JSON.stringify(result, null, 2)}`,
         record.stage = this.pauseRequested ? 'code_paused' : 'code_cancelled';
         await writeRecord();
         this.paused = true;
-        this.setStatus(`${this.pauseRequested ? 'Paused' : 'Stopped'} during ${activeStage} in code round ${round}/${preset.maxCodeRounds}. You can resume this run.`);
+        this.setStatus(implementationProgress(round, preset.maxCodeRounds, `${this.pauseRequested ? 'Paused' : 'Stopped'} during ${activeStage}; this run can be resumed`));
         this.post({ type: 'paused', paused: true });
       } else {
         record.stage = 'code_failed';
@@ -3921,14 +4435,14 @@ function validatePreset(value: unknown): Preset {
 function html(): string {
   return `<!doctype html><html><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';"><style>
   :root{--blue:#58a6ff;--green:#3fb950;--purple:#bc8cff;--orange:#d29922;--pink:#f778ba;--cyan:#39c5cf}html{overflow-y:auto;scroll-padding-bottom:96px}body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);padding:12px 12px 96px;margin:0;overflow-y:auto}h1{font-size:18px;margin:0}.app-header{margin:2px 0 14px}.title-row{display:flex;align-items:center;gap:8px}.version{font-size:11px;font-weight:600;padding:2px 7px;border:1px solid var(--blue);border-radius:10px;color:var(--blue)}h2{font-size:14px;margin:10px 0 4px}label{display:block;margin:10px 0 4px}input,select,textarea,button{box-sizing:border-box;width:100%;padding:6px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border)}textarea{min-height:85px}button{margin-top:8px;cursor:pointer;background:var(--vscode-button-background);color:var(--vscode-button-foreground)}button:disabled,input:disabled,select:disabled,textarea:disabled{cursor:not-allowed;opacity:.5}.row,.button-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}.check-row{display:flex;align-items:flex-start;gap:8px;margin:12px 0 4px}.check-row input{width:auto;margin:2px 0 0}.check-row label{margin:0;line-height:1.35}.secondary{background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}.workflow-section{--accent:var(--blue);border:1px solid var(--vscode-panel-border);border-left:3px solid var(--accent);border-radius:4px;margin:0 0 12px;overflow:hidden;background:var(--vscode-sideBar-background)}.workflow-section>summary{cursor:pointer;font-size:13px;font-weight:700;padding:9px 10px;color:var(--accent);background:var(--vscode-sideBarSectionHeader-background);user-select:none}.workflow-section[open]>summary{border-bottom:1px solid var(--vscode-panel-border)}.section-body{padding:3px 10px 11px}.tone-green{--accent:var(--green)}.tone-purple{--accent:var(--purple)}.tone-orange{--accent:var(--orange)}.tone-pink{--accent:var(--pink)}.tone-cyan{--accent:var(--cyan)}.role{border-top:1px solid var(--vscode-panel-border);margin-top:12px;padding-top:4px}.role:first-child{border-top:0;margin-top:4px}.role h2{color:var(--vscode-descriptionForeground)}#status,#interactionPrompt,#interactionDetailsText{white-space:pre-wrap;user-select:text;-webkit-user-select:text}#status{font-weight:600;line-height:1.4;padding:8px;border-left:3px solid var(--green);background:var(--vscode-textBlockQuote-background)}#status:empty{display:none}#interaction{padding-bottom:36px}#interactionDetails{margin:10px 0;border:1px solid var(--vscode-panel-border);padding:8px}#interactionDetails summary{cursor:pointer;font-weight:600}#interactionDetailsText{font-family:var(--vscode-font-family);font-size:12px;line-height:1.4}#artifacts{margin-top:10px}#artifacts button{text-align:left;font-size:12px}.muted{opacity:.8;font-size:12px}.phase{border:1px solid var(--vscode-panel-border);padding:8px;margin-top:8px}.phase strong,.phase span{display:block}.phase span{margin-top:5px;white-space:pre-wrap}</style></head><body>
-  <header class="app-header"><div class="title-row"><h1>CodeFlow Conductor</h1><span class="version">v0.47.5</span></div><p class="muted">From requirements to reviewed, accepted code.</p></header>
+  <header class="app-header"><div class="title-row"><h1>CodeFlow Conductor</h1><span class="version">v0.47.18</span></div><p class="muted">From requirements to reviewed, accepted code.</p></header>
   <details class="workflow-section tone-purple" open><summary>Presets</summary><div class="section-body"><label>Saved preset</label><select id="presetList"></select><div class="button-row"><button id="loadPreset" class="secondary">Load selected</button><button id="deletePreset" class="secondary">Delete selected</button></div><label>Preset name</label><input id="name"><div class="button-row"><button id="save" class="secondary">Save preset</button><button id="renamePreset" class="secondary">Rename selected</button></div><p class="muted">To rename, load a preset, edit its name, then choose Rename selected.</p></div></details>
   <details class="workflow-section tone-green" open><summary>Starting point</summary><div class="section-body"><label>Task</label><textarea id="task" placeholder="Describe the change to plan"></textarea><label>Existing plan (optional)</label><button id="choosePlan" class="secondary">Choose an existing plan</button><p id="selectedPlan" class="muted">No plan selected — the planner will create one.</p></div></details>
   <details class="workflow-section tone-orange"><summary>Local Ollama assistance</summary><div class="section-body"><label>Requirements baseline</label><select id="requirementsGuard"><option value="off">Off — use the existing workflow</option><option value="ollama">Ollama — extract locally, then require human approval</option></select><label>Ollama model</label><input id="ollamaModel" list="ollamaModels" placeholder="Choose an installed local model"><datalist id="ollamaModels"></datalist><button id="refreshOllamaModels" class="secondary">Refresh local Ollama models</button><button id="chooseRequirementsSource" class="secondary">Choose approved specification (optional)</button><p id="selectedRequirementsSource" class="muted">The task and approved parent roadmap will be used when no separate specification is selected.</p><label>Local planning starter</label><select id="localPlanningStarter"><option value="on">On — prepare a first draft or revision packet for Claude</option><option value="off">Off</option></select><label>Local implementation starter</label><select id="localImplementationStarter"><option value="on">On — prepare an advisory file-and-test work packet first</option><option value="off">Off — Claude starts implementation without it</option></select><p class="muted">Ollama starters are advisory and cannot approve work. Claude sessions are resumed between rounds when Claude Code returns a session ID.</p></div></details>
-  <details class="workflow-section tone-cyan"><summary>Workflow models and limits</summary><div class="section-body"><button id="refreshModels" class="secondary">Refresh available Codex models</button><p id="modelStatus" class="muted">Model list has not been checked.</p><div class="check-row"><input id="secondarySolApproval" type="checkbox"><label for="secondarySolApproval"><strong>Use a secondary approval reviewer</strong><br><span class="muted">Audits and may approve requirements, the final plan, and completed implementation. Approved requirements continue into planning; an approved final plan starts implementation automatically.</span></label></div><label>Secondary approval model</label><input id="secondaryApprovalModel" list="codexModels" placeholder="gpt-6.1-sol"><div class="check-row"><input id="secondaryDecisionDelegation" type="checkbox"><label for="secondaryDecisionDelegation"><strong>Let the secondary reviewer resolve decision-only human pauses</strong><br><span class="muted">Uses approved requirements, prior guidance, and repository evidence. UI/device acceptance, credentials, destructive authorization, and unsupported owner preferences still pause for you.</span></label></div><datalist id="codexModels"></datalist><datalist id="claudeModels"><option value="sonnet"></option><option value="opus"></option><option value="haiku"></option><option value="fable"></option></datalist><div id="roles"></div><section class="role"><h2>Claude context</h2><label>Planner and implementer session reuse</label><select id="claudeSessionPolicy"><option value="checkpoint">Balanced — start fresh every 3 rounds (recommended)</option><option value="continuous">Always resume the same session</option><option value="fresh">Start fresh every round</option></select><p class="muted">Balanced keeps short-term continuity but starts a clean Claude context at each three-round boundary. Saved plans, ledgers, reviews, and implementation evidence are supplied to the new session.</p></section><section class="role"><h2>Claude subagents</h2><label>Explore model (blank = Claude Code default)</label><input id="claudeExploreModel" list="claudeExploreModels" placeholder="haiku"><datalist id="claudeExploreModels"><option value="haiku"></option><option value="sonnet"></option><option value="opus"></option><option value="fable"></option></datalist><p class="muted">Applies only to Claude Code’s read-only Explore subagent. Haiku reduces usage while the selected planner, reviewer, orchestrator, and implementer models stay unchanged.</p></section><label>Maximum planning rounds</label><input id="rounds" type="number" min="1" max="50"><label>Implementation review checkpoint</label><input id="codeRounds" type="number" min="1" max="30"><p class="muted">Bounded local work continues automatically in three-round blocks, up to a hard limit of 30.</p></div></details>
-  <details id="progressSection" class="workflow-section tone-green" open><summary>Workflow progress and controls</summary><div class="section-body"><button id="start">Start planning</button><button id="returnToWorkflow" class="secondary" hidden>Return to waiting workflow</button><div class="button-row"><button id="pause" class="secondary">Pause</button><button id="stop" class="secondary">Stop</button></div><label>Change preset when resuming (optional)</label><select id="currentRunPreset"><option value="">Keep the preset saved with this run</option></select><label id="resumeGuidanceLabel" hidden>Guidance for the resumed run (optional)</label><textarea id="resumeGuidance" hidden placeholder="Add instructions, corrections, or decisions to preserve when the run resumes"></textarea><button id="reopenApprovedRequirements" class="secondary" hidden>Reopen requirements baseline with correction</button><button id="resumeCurrent" class="secondary">Resume current run</button><button id="resumeSaved" class="secondary">Resume saved run…</button><p id="status" role="status"></p><section id="interaction" hidden><label id="interactionPrompt">Your response</label><details id="interactionDetails" hidden><summary>Show step-by-step instructions</summary><pre id="interactionDetailsText"></pre></details><button id="copyInteraction" class="secondary">Copy workflow message</button><button id="returnToPrerequisite" hidden>Return to waiting workflow</button><div id="roadmapAcceptance" class="phase" hidden><strong id="roadmapAcceptanceTitle">Provisional roadmap acceptance</strong><span class="muted">Paste the secondary review or owner notes. These notes will be inherited by focused phase plans without changing the approved roadmap.</span><textarea id="roadmapNotes" placeholder="Paste the secondary review or roadmap notes"></textarea><button id="acceptRoadmap">Provisionally accept roadmap</button></div><label id="phasePresetLabel" hidden>Preset for the phase you start</label><select id="phasePreset" hidden></select><p id="approvalGuidanceHelp" class="muted" hidden>Add optional instructions, constraints, or owner decisions for implementation. This guidance is saved with the run and given to the implementer; it does not rewrite the approved plan.</p><textarea id="humanInput" placeholder="Answer the question or give guidance"></textarea><button id="approveRequirements">Approve requirements baseline</button><button id="regenerateRequirements" class="secondary">Add correction and reconcile baseline</button><button id="attachRequirementsGuard">Attach local requirements guard to this run</button><button id="continue">Respond and continue planning</button><button id="continueCode">Respond and continue code review</button><button id="completeAcceptance">Record acceptance results and complete phase</button><button id="startPrerequisiteWorkflow">Start prerequisite workflow</button><button id="recheckPrerequisite" class="secondary">Recheck prerequisite</button><button id="implementPlan">Implement approved plan</button><button id="startNextPhase">Plan next phase</button><button id="continuePlanning">Continue planning with guidance</button><button id="continueImplementation">Continue implementation for 3 more rounds</button><button id="runFinalVerification">Run remaining verification and final review</button><button id="retry" class="secondary">Retry failed stage</button><div id="splitPhases" hidden></div></section><div id="artifacts"></div></div></details>
+  <details class="workflow-section tone-cyan"><summary>Workflow models and limits</summary><div class="section-body"><button id="refreshModels" class="secondary">Refresh available models</button><p id="modelStatus" class="muted">Model lists have not been checked.</p><div class="check-row"><input id="secondarySolApproval" type="checkbox"><label for="secondarySolApproval"><strong>Use a secondary approval reviewer</strong><br><span class="muted">Audits and may approve requirements, the final plan, and completed implementation. Approved requirements continue into planning; an approved final plan starts implementation automatically.</span></label></div><label>Secondary approval model</label><input id="secondaryApprovalModel" list="codexModels" placeholder="gpt-6.1-sol"><div class="check-row"><input id="secondaryDecisionDelegation" type="checkbox"><label for="secondaryDecisionDelegation"><strong>Let the secondary reviewer resolve decision-only human pauses</strong><br><span class="muted">Uses approved requirements, prior guidance, and repository evidence. UI/device acceptance, credentials, destructive authorization, and unsupported owner preferences still pause for you.</span></label></div><datalist id="codexModels"></datalist><datalist id="claudeModels"><option value="sonnet" label="Sonnet — latest alias"></option><option value="opus" label="Opus — latest alias"></option><option value="haiku" label="Haiku — latest alias"></option><option value="fable" label="Fable — latest alias"></option></datalist><div id="roles"></div><section class="role"><h2>Claude context</h2><label>Planner and implementer session reuse</label><select id="claudeSessionPolicy"><option value="checkpoint">Balanced — start fresh every 3 rounds (recommended)</option><option value="continuous">Always resume the same session</option><option value="fresh">Start fresh every round</option></select><p class="muted">Balanced keeps short-term continuity but starts a clean Claude context at each three-round boundary. Saved plans, ledgers, reviews, and implementation evidence are supplied to the new session.</p></section><section class="role"><h2>Claude subagents</h2><label>Explore model (blank = Claude Code default)</label><input id="claudeExploreModel" list="claudeExploreModels" placeholder="haiku"><datalist id="claudeExploreModels"><option value="haiku" label="Haiku — latest alias"></option><option value="sonnet" label="Sonnet — latest alias"></option><option value="opus" label="Opus — latest alias"></option><option value="fable" label="Fable — latest alias"></option></datalist><p class="muted">Applies only to Claude Code’s read-only Explore subagent. Haiku reduces usage while the selected planner, reviewer, orchestrator, and implementer models stay unchanged.</p></section><label>Maximum planning rounds</label><input id="rounds" type="number" min="1" max="50"><label>Implementation review checkpoint</label><input id="codeRounds" type="number" min="1" max="30"><p class="muted">Bounded local work continues automatically in three-round blocks, up to a hard limit of 30.</p></div></details>
+  <details id="progressSection" class="workflow-section tone-green" open><summary>Workflow progress and controls</summary><div class="section-body"><button id="start">Start planning</button><button id="returnToWorkflow" class="secondary" hidden>Return and recheck parent</button><div class="button-row"><button id="pause" class="secondary">Pause</button><button id="stop" class="secondary">Stop</button></div><label>Change preset when resuming (optional)</label><select id="currentRunPreset"><option value="">Keep the preset saved with this run</option></select><label id="resumeGuidanceLabel" hidden>Guidance for the resumed run (optional)</label><textarea id="resumeGuidance" hidden placeholder="Add instructions, corrections, or decisions to preserve when the run resumes"></textarea><button id="reopenApprovedRequirements" class="secondary" hidden>Reopen requirements baseline with correction</button><button id="resumeCurrent" class="secondary">Resume current run</button><button id="resumeSaved" class="secondary">Resume saved run…</button><p id="status" role="status"></p><section id="interaction" hidden><label id="interactionPrompt">Your response</label><details id="interactionDetails" hidden><summary>Show step-by-step instructions</summary><pre id="interactionDetailsText"></pre></details><button id="copyInteraction" class="secondary">Copy workflow message</button><button id="returnToPrerequisite" hidden>Return and recheck parent</button><div id="roadmapAcceptance" class="phase" hidden><strong id="roadmapAcceptanceTitle">Provisional roadmap acceptance</strong><span class="muted">Paste the secondary review or owner notes. These notes will be inherited by focused phase plans without changing the approved roadmap.</span><textarea id="roadmapNotes" placeholder="Paste the secondary review or roadmap notes"></textarea><button id="acceptRoadmap">Provisionally accept roadmap</button></div><label id="phasePresetLabel" hidden>Preset for the phase you start</label><select id="phasePreset" hidden></select><p id="approvalGuidanceHelp" class="muted" hidden>Add optional instructions, constraints, or owner decisions for implementation. This guidance is saved with the run and given to the implementer; it does not rewrite the approved plan.</p><textarea id="humanInput" placeholder="Answer the question or give guidance"></textarea><button id="approveRequirements">Approve requirements baseline</button><button id="regenerateRequirements" class="secondary">Add correction and reconcile baseline</button><button id="attachRequirementsGuard">Attach local requirements guard to this run</button><button id="continue">Respond and continue planning</button><button id="continueCode">Respond and continue code review</button><button id="completeAcceptance">Record acceptance results and complete phase</button><button id="startPrerequisiteWorkflow">Start prerequisite workflow</button><button id="recheckPrerequisite" class="secondary">Recheck prerequisite</button><button id="implementPlan">Implement approved plan</button><button id="startNextPhase">Plan next phase</button><button id="continuePlanning">Continue planning with guidance</button><button id="continueImplementation">Continue implementation for 3 more rounds</button><button id="runFinalVerification">Run remaining verification and final review</button><button id="retry" class="secondary">Retry failed stage</button><div id="splitPhases" hidden></div></section><div id="artifacts"></div></div></details>
   <details class="workflow-section tone-pink"><summary>Phone alerts and remote controls</summary><div class="section-body"><p id="mobileStatus" class="muted">Mobile access is loading…</p><p id="mobileTopic" class="muted"></p><p id="mobilePairing" class="muted"></p><button id="setupMobile" class="secondary">Enable phone access</button><button id="testMobile" class="secondary">Send test phone alert</button><button id="mobileSignIn" class="secondary">Refresh Microsoft dev tunnel sign-in</button><button id="startMobileTunnel" class="secondary">Start phone dashboard</button><button id="stopMobileTunnel" class="secondary">Stop phone dashboard</button><button id="openMobileDashboard" class="secondary">Open phone dashboard</button><button id="regeneratePairing" class="secondary">Create new pairing code</button><button id="disableMobile" class="secondary">Disable phone access</button><p id="mobileError" class="muted"></p></div></details>
-  <script>const vscode=acquireVsCodeApi();const roles=['planner','reviewer','orchestrator','implementer','codeReviewer'];const roleLabels={planner:'Planner',reviewer:'Plan reviewer',orchestrator:'Orchestrator',implementer:'Implementer',codeReviewer:'Code reviewer'};const roleBox=document.getElementById('roles');for(const name of roles){const box=document.createElement('div');box.className='role';box.innerHTML='<h2>'+roleLabels[name]+'</h2><div class="row"><div><label>Provider</label><select id="'+name+'Provider"><option value="claude">Claude Code</option><option value="codex">Codex</option></select></div><div><label>Effort</label><select id="'+name+'Effort"><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option><option>ultra</option></select></div></div><label>Model (blank = CLI default)</label><input id="'+name+'Model" list="claudeModels" placeholder="Choose an available model">';roleBox.appendChild(box)}const declineRequirementsButton=document.createElement('button');declineRequirementsButton.id='declineRequirements';declineRequirementsButton.className='secondary';declineRequirementsButton.textContent='Decline baseline and continue with approved source';declineRequirementsButton.hidden=true;document.getElementById('approveRequirements').insertAdjacentElement('afterend',declineRequirementsButton);declineRequirementsButton.onclick=()=>vscode.postMessage({type:'declineRequirements',humanInput:document.getElementById('humanInput').value});
+  <script>const vscode=acquireVsCodeApi();const roles=['planner','reviewer','orchestrator','implementer','codeReviewer'];const roleLabels={planner:'Planner',reviewer:'Plan reviewer',orchestrator:'Orchestrator',implementer:'Implementer',codeReviewer:'Code reviewer'};const roleBox=document.getElementById('roles');for(const name of roles){const box=document.createElement('div');box.className='role';box.innerHTML='<h2>'+roleLabels[name]+'</h2><div class="row"><div><label>Provider</label><select id="'+name+'Provider"><option value="claude">Claude Code</option><option value="codex">Codex</option></select></div><div><label>Effort</label><select id="'+name+'Effort"><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option><option>ultra</option></select></div></div><label>Model (blank = CLI default)</label><input id="'+name+'Model" list="claudeModels" placeholder="Choose an available model">';roleBox.appendChild(box)}const declineRequirementsButton=document.createElement('button');declineRequirementsButton.id='declineRequirements';declineRequirementsButton.className='secondary';declineRequirementsButton.textContent='Continue from approved source without generated baseline';declineRequirementsButton.hidden=true;document.getElementById('approveRequirements').insertAdjacentElement('afterend',declineRequirementsButton);declineRequirementsButton.onclick=()=>vscode.postMessage({type:'continueWithoutGeneratedBaseline'});
   const el=id=>document.getElementById(id);let selectedPlanPath='';let selectedRequirementsSourcePath='';let loadedPresetName='';let availablePresets=[];let isRunning=false;let canResume=false;let canReopenApprovedRequirements=false;const collect=()=>({name:el('name').value,claudeExploreModel:el('claudeExploreModel').value,claudeSessionPolicy:el('claudeSessionPolicy').value,requirementsGuard:el('requirementsGuard').value==='ollama',ollamaModel:el('ollamaModel').value,localPlanningStarter:el('localPlanningStarter').value==='on',localImplementationStarter:el('localImplementationStarter').value==='on',secondarySolApproval:el('secondarySolApproval').checked,secondaryApprovalModel:el('secondaryApprovalModel').value,secondaryDecisionDelegation:el('secondaryDecisionDelegation').checked,maxRounds:Number(el('rounds').value),maxCodeRounds:Number(el('codeRounds').value),...Object.fromEntries(roles.map(n=>[n,{provider:el(n+'Provider').value,model:el(n+'Model').value,effort:el(n+'Effort').value}]))});const apply=p=>{loadedPresetName=p.name;el('name').value=p.name;el('claudeExploreModel').value=p.claudeExploreModel===undefined?'haiku':p.claudeExploreModel;el('claudeSessionPolicy').value=p.claudeSessionPolicy||'checkpoint';el('requirementsGuard').value=p.requirementsGuard?'ollama':'off';el('ollamaModel').value=p.ollamaModel||'';el('localPlanningStarter').value=p.localPlanningStarter===false?'off':'on';el('localImplementationStarter').value=p.localImplementationStarter===false?'off':'on';el('secondarySolApproval').checked=p.secondarySolApproval===true;el('secondaryApprovalModel').value=p.secondaryApprovalModel||'gpt-6.1-sol';el('secondaryDecisionDelegation').checked=p.secondaryDecisionDelegation===true;el('rounds').value=p.maxRounds;el('codeRounds').value=p.maxCodeRounds||3;for(const n of roles){const fallback=n==='implementer'?p.planner:n==='codeReviewer'?p.reviewer:p[n];el(n+'Provider').value=fallback.provider;el(n+'Model').value=fallback.model;el(n+'Effort').value=fallback.effort}updateControls()};const updateControls=()=>{el('start').disabled=isRunning;el('start').textContent=isRunning?'Workflow in progress…':selectedPlanPath?'Review existing plan':'Start planning';el('pause').disabled=!isRunning;el('stop').disabled=!isRunning;el('resumeCurrent').disabled=isRunning||!canResume;el('resumeSaved').disabled=isRunning;el('reopenApprovedRequirements').disabled=isRunning||!canResume||!canReopenApprovedRequirements;el('continuePlanning').disabled=isRunning;el('continueCode').disabled=isRunning;el('completeAcceptance').disabled=isRunning;el('startPrerequisiteWorkflow').disabled=isRunning;el('recheckPrerequisite').disabled=isRunning;el('continueImplementation').disabled=isRunning;el('runFinalVerification').disabled=isRunning;el('implementPlan').disabled=isRunning;el('startNextPhase').disabled=isRunning;el('acceptRoadmap').disabled=isRunning;el('approveRequirements').disabled=isRunning;el('regenerateRequirements').disabled=isRunning;el('attachRequirementsGuard').disabled=isRunning;for(const id of ['presetList','loadPreset','deletePreset','renamePreset','phasePreset','currentRunPreset','refreshModels','name','task','choosePlan','requirementsGuard','ollamaModel','localPlanningStarter','localImplementationStarter','secondarySolApproval','secondaryApprovalModel','secondaryDecisionDelegation','refreshOllamaModels','chooseRequirementsSource','claudeExploreModel','claudeSessionPolicy','rounds','codeRounds','save',...roles.flatMap(n=>[n+'Provider',n+'Model',n+'Effort'])])el(id).disabled=isRunning;el('secondaryDecisionDelegation').disabled=isRunning||!el('secondarySolApproval').checked;for(const button of el('splitPhases').querySelectorAll('button'))button.disabled=isRunning;for(const textarea of el('splitPhases').querySelectorAll('textarea'))textarea.disabled=isRunning};const setRunning=running=>{isRunning=running;updateControls()};const setPaused=paused=>{canResume=paused;el('resumeGuidanceLabel').hidden=!paused;el('resumeGuidance').hidden=!paused;el('reopenApprovedRequirements').hidden=!(paused&&canReopenApprovedRequirements);updateControls()};const run=(humanInput,type='start')=>{el('interaction').hidden=true;if(type==='start')el('artifacts').replaceChildren();setPaused(false);setRunning(true);vscode.postMessage({type,task:el('task').value,preset:collect(),humanInput,planPath:selectedPlanPath,requirementsSourcePath:selectedRequirementsSourcePath})};el('secondarySolApproval').addEventListener('change',updateControls);
   const artifactFileName=value=>String(value||'').split('/').pop();const artifactRoundFromName=(name,pattern)=>{const match=artifactFileName(name).match(pattern);return match?Number(match[1]):-1};const artifactFriendlyName=name=>{const file=artifactFileName(name);let match=file.match(/^round-([0-9]+)-plan[.]md$/);if(match)return'Current plan — round '+match[1];match=file.match(/^round-([0-9]+)-local-planning-starter[.]md$/);if(match)return'Ollama planning starter — round '+match[1];match=file.match(/^code-round-([0-9]+)-implementation[.]md$/);if(match)return'Latest implementation report — round '+match[1];match=file.match(/^code-round-([0-9]+)-local-implementation-starter[.]md$/);if(match)return'Ollama implementation starter — round '+match[1];if(file==='requirements-baseline.md')return'Requirements baseline';if(file==='requirements-corrections.md')return'Locked requirements corrections';if(file==='working-plan.md')return'Working plan';if(file==='human-acceptance-required.md')return'Human acceptance checklist';if(file==='human-acceptance-results.md')return'Human acceptance results';if(file==='00-workflow-overview.md')return'Approved workflow overview';return name};let artifactObserver;const organizeArtifactButtons=()=>{const host=el('artifacts');const buttons=[...host.querySelectorAll('button')];if(!buttons.length)return;for(const button of buttons)if(!button.dataset.artifactName)button.dataset.artifactName=button.textContent||'';const latestPlan=Math.max(-1,...buttons.map(button=>artifactRoundFromName(button.dataset.artifactName,/^round-([0-9]+)-plan[.]md$/)));const latestLocalPlan=Math.max(-1,...buttons.map(button=>artifactRoundFromName(button.dataset.artifactName,/^round-([0-9]+)-local-planning-starter[.]md$/)));const latestImplementation=Math.max(-1,...buttons.map(button=>artifactRoundFromName(button.dataset.artifactName,/^code-round-([0-9]+)-implementation[.]md$/)));const latestLocalImplementation=Math.max(-1,...buttons.map(button=>artifactRoundFromName(button.dataset.artifactName,/^code-round-([0-9]+)-local-implementation-starter[.]md$/)));const primary=[];const technical=[];for(const button of buttons){const name=button.dataset.artifactName;const file=artifactFileName(name);const useful=file==='requirements-baseline.md'||file==='requirements-corrections.md'||file==='working-plan.md'||file==='human-acceptance-required.md'||file==='human-acceptance-results.md'||file==='00-workflow-overview.md'||/-approved(?:-plan-index)?[.]md$/.test(file)||/^code-round-[0-9]+-human-action[.]md$/.test(file)||/failure[.]txt$/.test(file)||(artifactRoundFromName(name,/^round-([0-9]+)-plan[.]md$/)===latestPlan&&latestPlan>=0)||(artifactRoundFromName(name,/^round-([0-9]+)-local-planning-starter[.]md$/)===latestLocalPlan&&latestLocalPlan>=0)||(artifactRoundFromName(name,/^code-round-([0-9]+)-implementation[.]md$/)===latestImplementation&&latestImplementation>=0)||(artifactRoundFromName(name,/^code-round-([0-9]+)-local-implementation-starter[.]md$/)===latestLocalImplementation&&latestLocalImplementation>=0);button.textContent=useful?artifactFriendlyName(name):name;(useful?primary:technical).push(button)}artifactObserver.disconnect();host.replaceChildren(...primary);if(technical.length){const details=document.createElement('details');details.className='phase';const summary=document.createElement('summary');summary.textContent='Technical run history ('+technical.length+' files)';details.append(summary,...technical);host.appendChild(details)}artifactObserver.observe(host,{childList:true,subtree:true})};artifactObserver=new MutationObserver(organizeArtifactButtons);artifactObserver.observe(el('artifacts'),{childList:true,subtree:true});
   el('returnToWorkflow').onclick=()=>{el('returnToWorkflow').disabled=true;vscode.postMessage({type:'returnToWorkflow'})};
@@ -3936,6 +4450,8 @@ function html(): string {
   const reopenPhaseButton=document.createElement('button');reopenPhaseButton.id='reopenPhase';reopenPhaseButton.className='secondary';reopenPhaseButton.textContent='Reopen completed phase with findings';reopenPhaseButton.hidden=true;el('startNextPhase').insertAdjacentElement('afterend',reopenPhaseButton);reopenPhaseButton.onclick=()=>{const findings=el('humanInput').value.trim();if(!findings){el('status').textContent='Paste the outside review findings before reopening this phase.';return}el('interaction').hidden=true;setRunning(true);vscode.postMessage({type:'reopenCompletedPhase',humanInput:findings})};
   const acceptanceButtonLabel='Record acceptance results and complete phase';let acceptanceConfirmationArmed=false;const resetAcceptanceConfirmation=()=>{acceptanceConfirmationArmed=false;el('completeAcceptance').textContent=acceptanceButtonLabel;el('completeAcceptance').disabled=isRunning};el('humanInput').addEventListener('input',resetAcceptanceConfirmation);el('completeAcceptance').onclick=()=>{if(!acceptanceConfirmationArmed){acceptanceConfirmationArmed=true;el('completeAcceptance').textContent='Confirm: record results and complete phase';return}el('completeAcceptance').disabled=true;el('completeAcceptance').textContent='Recording acceptance results…';vscode.postMessage({type:'completeAcceptance',humanInput:el('humanInput').value})};
   for(const id of ['status','interactionPrompt','interactionDetailsText'])el(id).addEventListener('mousedown',()=>{const active=document.activeElement;if(active instanceof HTMLInputElement||active instanceof HTMLTextAreaElement)active.blur()});
+  const showClaudeModels=models=>{const current=Object.fromEntries(models.filter(model=>model.section==='main'&&model.family).map(model=>[model.family,model]));const aliases=['opus','sonnet','haiku','fable'].map(alias=>{const o=document.createElement('option');o.value=alias;o.label=alias[0].toUpperCase()+alias.slice(1)+' — latest alias'+(current[alias]?' (currently '+current[alias].name+')':'');return o});const versions=models.map(model=>{const o=document.createElement('option');o.value=model.id;o.label=model.name+(model.section==='main'?' — current':' — older')+(model.supportedEfforts.length?' — '+model.supportedEfforts.join(', '):'');return o});for(const id of ['claudeModels','claudeExploreModels'])el(id).replaceChildren(...aliases.map(option=>option.cloneNode(true)),...versions.map(option=>option.cloneNode(true)))};
+  window.addEventListener('message',event=>{const m=event.data;if(m.type==='claudeModels')showClaudeModels(m.models||[])});
   const updateModelList=name=>el(name+'Model').setAttribute('list',el(name+'Provider').value==='codex'?'codexModels':'claudeModels');for(const name of roles)el(name+'Provider').addEventListener('change',()=>updateModelList(name));
   el('start').onclick=()=>run('');el('pause').onclick=()=>vscode.postMessage({type:'pause'});el('resumeCurrent').onclick=()=>{setRunning(true);vscode.postMessage({type:'resumeCurrent',presetName:el('currentRunPreset').value,humanInput:el('resumeGuidance').value})};el('resumeSaved').onclick=()=>vscode.postMessage({type:'selectRun'});el('reopenApprovedRequirements').onclick=()=>{const correction=el('resumeGuidance').value.trim();if(!correction){el('status').textContent='Paste the cumulative requirements correction before reopening the baseline.';return}setRunning(true);vscode.postMessage({type:'reopenApprovedRequirements',humanInput:correction})};el('stop').onclick=()=>vscode.postMessage({type:'stop'});el('save').onclick=()=>vscode.postMessage({type:'save',preset:collect()});el('renamePreset').onclick=()=>vscode.postMessage({type:'renamePreset',previousName:loadedPresetName,preset:collect()});el('loadPreset').onclick=()=>vscode.postMessage({type:'selectPreset',name:el('presetList').value});el('deletePreset').onclick=()=>vscode.postMessage({type:'deletePreset',name:el('presetList').value});el('refreshModels').onclick=()=>vscode.postMessage({type:'refreshModels'});el('choosePlan').onclick=()=>vscode.postMessage({type:'selectPlan'});el('continue').onclick=()=>run(el('humanInput').value,'continue');el('continueCode').onclick=()=>run(el('humanInput').value,'continueCode');el('completeAcceptance').onclick=()=>{if(confirm('Record these results as the final acceptance outcome and complete this phase?'))vscode.postMessage({type:'completeAcceptance',humanInput:el('humanInput').value})};el('acceptRoadmap').onclick=()=>vscode.postMessage({type:'acceptRoadmap',humanInput:el('roadmapNotes').value});el('startPrerequisiteWorkflow').onclick=()=>{el('interaction').hidden=true;setRunning(true);vscode.postMessage({type:'startPrerequisiteWorkflow'})};el('recheckPrerequisite').onclick=()=>{el('interaction').hidden=true;setRunning(true);vscode.postMessage({type:'recheckPrerequisite'})};el('implementPlan').onclick=()=>{el('interaction').hidden=true;setRunning(true);vscode.postMessage({type:'implementPlan',humanInput:el('humanInput').value})};el('startNextPhase').onclick=()=>{el('interaction').hidden=true;setRunning(true);vscode.postMessage({type:'startNextPhase',humanInput:el('humanInput').value,presetName:el('phasePreset').value})};el('continuePlanning').onclick=()=>{el('interaction').hidden=true;setRunning(true);vscode.postMessage({type:'continuePlanning',humanInput:el('humanInput').value})};el('continueImplementation').onclick=()=>run(el('humanInput').value,'continueImplementation');el('runFinalVerification').onclick=()=>run(el('humanInput').value,'runFinalVerification');el('retry').onclick=()=>{el('interaction').hidden=true;setRunning(true);vscode.postMessage({type:'resumeCurrent',presetName:el('currentRunPreset').value})};el('setupMobile').onclick=()=>vscode.postMessage({type:'setupMobile'});el('testMobile').onclick=()=>vscode.postMessage({type:'testMobile'});el('mobileSignIn').onclick=()=>vscode.postMessage({type:'mobileSignIn'});el('startMobileTunnel').onclick=()=>vscode.postMessage({type:'startMobileTunnel'});el('stopMobileTunnel').onclick=()=>vscode.postMessage({type:'stopMobileTunnel'});el('openMobileDashboard').onclick=()=>vscode.postMessage({type:'openMobileDashboard'});el('regeneratePairing').onclick=()=>vscode.postMessage({type:'regeneratePairing'});el('disableMobile').onclick=()=>vscode.postMessage({type:'disableMobile'});
   el('refreshOllamaModels').onclick=()=>vscode.postMessage({type:'refreshOllamaModels'});el('chooseRequirementsSource').onclick=()=>vscode.postMessage({type:'selectRequirementsSource'});el('approveRequirements').onclick=()=>vscode.postMessage({type:'approveRequirements'});el('regenerateRequirements').onclick=()=>vscode.postMessage({type:'regenerateRequirements',humanInput:el('humanInput').value});el('attachRequirementsGuard').onclick=()=>vscode.postMessage({type:'attachRequirementsGuard',preset:collect(),requirementsSourcePath:selectedRequirementsSourcePath,humanInput:el('humanInput').value});
@@ -3945,8 +4461,10 @@ function html(): string {
   window.addEventListener('message',event=>{const m=event.data;if(m.type==='restore'){const prerequisiteComplete=m.interaction?.type==='prerequisiteComplete';el('returnToWorkflow').hidden=!m.canReturnToWorkflow;el('returnToWorkflow').disabled=Boolean(m.running);el('returnToPrerequisite').hidden=!prerequisiteComplete;el('returnToPrerequisite').disabled=Boolean(m.running);if(m.interaction?.type==='morePlanning')el('continuePlanning').textContent=m.interaction.finalCorrection?'Apply one final bounded correction':'Continue planning for 3 more rounds'}if(m.type==='running'){el('returnToWorkflow').disabled=Boolean(m.running);el('returnToPrerequisite').disabled=Boolean(m.running)}});
   window.addEventListener('message',event=>{const m=event.data;if(m.type==='ollamaModels'){el('ollamaModels').replaceChildren(...m.models.map(name=>{const o=document.createElement('option');o.value=name;return o}));if(!el('ollamaModel').value&&m.models.length)el('ollamaModel').value=m.models[0]}if(m.type==='requirementsSourceSelected'){selectedRequirementsSourcePath=m.path;el('selectedRequirementsSource').textContent='Selected: '+m.name}if(m.type==='restore'){const i=m.interaction;const approval=i?.type==='requirementsApproval';el('approveRequirements').hidden=!approval;el('regenerateRequirements').hidden=!approval;el('attachRequirementsGuard').hidden=!(i?.type==='morePlanning'&&!i.requirementsGuardAttached);if(approval){el('humanInput').hidden=false;el('humanInput').placeholder='Add a correction. Earlier corrections remain locked.';el('humanInput').value=''}}});
   window.addEventListener('message',event=>{const m=event.data;if(m.type==='restore'){const canReopen=Boolean(m.interaction?.canReopen);reopenPhaseButton.hidden=!canReopen;reopenPhaseButton.disabled=Boolean(m.running);if(canReopen){el('humanInput').hidden=false;el('humanInput').placeholder='Paste the outside review findings that require this completed phase to be reopened'}}if(m.type==='running')reopenPhaseButton.disabled=Boolean(m.running)});
-  window.addEventListener('message',event=>{const m=event.data;if(m.type==='restore'){const approval=m.interaction?.type==='requirementsApproval';declineRequirementsButton.hidden=!approval;declineRequirementsButton.disabled=Boolean(m.running)}if(m.type==='running')declineRequirementsButton.disabled=Boolean(m.running)});
+  window.addEventListener('message',event=>{const m=event.data;if(m.type==='restore'){const baselineChoice=['requirementsApproval','requirementsFallback'].includes(m.interaction?.type);declineRequirementsButton.hidden=!baselineChoice;declineRequirementsButton.disabled=Boolean(m.running)}if(m.type==='running')declineRequirementsButton.disabled=Boolean(m.running)});
   window.addEventListener('message',event=>{const m=event.data;if(m.type==='restore'&&m.interaction?.type==='morePlanning'&&m.interaction.requirementsGuardLimit){el('humanInput').placeholder='Paste the targeted revision prompt or human direction required for the next focused pass';el('continuePlanning').textContent='Apply guidance and start focused revision'}});
+  window.addEventListener('message',event=>{const m=event.data;if(m.type==='restore'&&m.interaction?.type==='prerequisitePending'&&m.interaction.humanProcedure){el('humanInput').hidden=false;el('humanInput').placeholder='Record each PASS, FAIL, or UNVERIFIED observation without secrets or account identifiers';el('humanInput').value=m.interaction.responseTemplate||'';el('startPrerequisiteWorkflow').hidden=true;el('recheckPrerequisite').textContent='Record results and recheck prerequisite'}});
+  el('recheckPrerequisite').onclick=()=>{el('interaction').hidden=true;setRunning(true);vscode.postMessage({type:'recheckPrerequisite',humanInput:el('humanInput').value})};
   </script></body></html>`;
 }
 

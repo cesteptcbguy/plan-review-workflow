@@ -2,7 +2,7 @@
   "name": "plan-review-workflow",
   "displayName": "CodeFlow Conductor",
   "description": "Coordinate AI-assisted requirements, planning, implementation, review, acceptance, and remediation from VS Code.",
-  "version": "0.47.5",
+  "version": "0.47.18",
   "publisher": "local-workflow",
   "engines": {
     "vscode": "^1.96.0"
@@ -44,7 +44,7 @@
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --platform=node --target=node20 --external:vscode --outfile=dist/extension.js",
     "check": "tsc --noEmit",
-    "test": "esbuild src/prerequisite-state.ts src/process-lifecycle.ts src/workflow-safety.ts src/requirements.ts src/mobile.ts --bundle --platform=node --target=node20 --outdir=dist && node --test test/*.test.js",
+    "test": "esbuild src/prerequisite-state.ts src/process-lifecycle.ts src/workflow-safety.ts src/requirements.ts src/mobile.ts src/model-discovery.ts src/document-delivery.ts --bundle --platform=node --target=node20 --outdir=dist && node --test test/*.test.js",
     "package": "npm run build && vsce package"
   },
   "devDependencies": {

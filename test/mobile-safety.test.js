@@ -3,10 +3,22 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { allowedActions, MobileBridge } = require('../dist/mobile.js');
+const { allowedActions, dashboardHtml, MobileBridge } = require('../dist/mobile.js');
 
 test('phone dashboard permits roadmap acceptance', () => {
   assert.equal(allowedActions.has('acceptRoadmap'), true);
+  assert.equal(allowedActions.has('continueWithoutGeneratedBaseline'), true);
+});
+
+test('phone dashboard exposes and validates human prerequisite results', () => {
+  const html = dashboardHtml();
+  const extensionSource = fs.readFileSync(path.join(__dirname, '../src/extension.ts'), 'utf8');
+  assert.match(html, /humanPrerequisite=i\.type==='prerequisitePending'&&i\.humanProcedure/);
+  assert.match(html, /Complete the prerequisite results before rechecking/);
+  assert.match(html, /Record results and recheck prerequisite/);
+  assert.match(html, /if\(humanPrerequisite&&type==='startPrerequisiteWorkflow'\)continue/);
+  assert.match(extensionSource, /procedure && !validatePrerequisiteResults\(procedure, submission\)/);
+  assert.match(html, /nextCheckpointKey!==checkpointKey/);
 });
 
 test('explicitly stopping a rate-limited tunnel suppresses automatic retry', async () => {
